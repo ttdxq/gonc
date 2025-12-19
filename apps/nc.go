@@ -138,8 +138,18 @@ type AppNetcatConfig struct {
 }
 
 // AppNetcatConfigByArgs 解析给定的 []string 参数，生成 AppNetcatConfig
-func AppNetcatConfigByArgs(argv0 string, args []string) (*AppNetcatConfig, error) {
-	config := &AppNetcatConfig{
+func AppNetcatConfigByArgs(argv0 string, args []string) (config *AppNetcatConfig, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if e, ok := r.(error); ok {
+				err = fmt.Errorf("config error: %w", e)
+			} else {
+				err = fmt.Errorf("config error: %v", r)
+			}
+		}
+	}()
+
+	config = &AppNetcatConfig{
 		LogWriter: os.Stderr,
 		ctx:       context.Background(),
 	}
@@ -247,7 +257,7 @@ func AppNetcatConfigByArgs(argv0 string, args []string) (*AppNetcatConfig, error
 
 	// 解析传入的 args 切片
 	// 注意：我们假设 args 已经不包含程序名 (os.Args[0])，所以直接传入
-	err := fs.Parse(args)
+	err = fs.Parse(args) // err is named return param
 	if err != nil {
 		return nil, err // 解析错误直接返回
 	}
@@ -263,12 +273,12 @@ func AppNetcatConfigByArgs(argv0 string, args []string) (*AppNetcatConfig, error
 	err = configureSecurity(config)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Security configuration failed: %v\n", err)
-		os.Exit(1)
+		panic(fmt.Errorf("fatal exit"))
 	}
 
 	if fs.NFlag() == 0 && fs.NArg() == 0 {
 		usage_less(argv0)
-		os.Exit(1)
+		panic(fmt.Errorf("fatal exit"))
 	}
 
 	// 4. 从参数和标志确定网络类型、地址和P2P会话密钥
@@ -276,7 +286,7 @@ func AppNetcatConfigByArgs(argv0 string, args []string) (*AppNetcatConfig, error
 	if err != nil && len(config.featureModulesRun) == 0 {
 		fmt.Fprintf(os.Stderr, "Error determining network address: %v\n", err)
 		usage_less(argv0)
-		os.Exit(1)
+		panic(fmt.Errorf("fatal exit"))
 	}
 
 	config.network = network
@@ -399,12 +409,12 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 			ncconfig.runCmd = ":service"
 		} else {
 			fmt.Fprintf(os.Stderr, "-portrate and -e \":mux ...\"(socks5server/httpserver/linkagent) must be used together\n")
-			os.Exit(1)
+			panic(fmt.Errorf("fatal exit"))
 		}
 	} else if ncconfig.kcpBridgeMode {
 		if !strings.HasPrefix(ncconfig.runCmd, ":mux ") {
 			fmt.Fprintf(os.Stderr, "-kcpbr and -e \":mux ...\"(socks5server/httpserver/linkagent) must be used together\n")
-			os.Exit(1)
+			panic(fmt.Errorf("fatal exit"))
 		}
 	}
 
@@ -412,56 +422,56 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 		err := preinitBuiltinAppConfig(ncconfig, ncconfig.runCmd)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%v\n", err)
-			os.Exit(1)
+			panic(fmt.Errorf("fatal exit"))
 		}
 	} else {
 		if ncconfig.app_mux_args != "-" {
 			err := preinitBuiltinAppConfig(ncconfig, ":mux "+ncconfig.app_mux_args)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%v\n", err)
-				os.Exit(1)
+				panic(fmt.Errorf("fatal exit"))
 			}
 		}
 		if ncconfig.app_s5s_args != "-" {
 			err := preinitBuiltinAppConfig(ncconfig, ":s5s "+ncconfig.app_s5s_args)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%v\n", err)
-				os.Exit(1)
+				panic(fmt.Errorf("fatal exit"))
 			}
 		}
 		if ncconfig.app_sh_args != "-" {
 			err := preinitBuiltinAppConfig(ncconfig, ":sh "+ncconfig.app_sh_args)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%v\n", err)
-				os.Exit(1)
+				panic(fmt.Errorf("fatal exit"))
 			}
 		}
 		if ncconfig.app_nc_args != "-" {
 			err := preinitBuiltinAppConfig(ncconfig, ":nc "+ncconfig.app_nc_args)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%v\n", err)
-				os.Exit(1)
+				panic(fmt.Errorf("fatal exit"))
 			}
 		}
 		if ncconfig.app_pr_args != "-" {
 			err := preinitBuiltinAppConfig(ncconfig, ":pr "+ncconfig.app_pr_args)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%v\n", err)
-				os.Exit(1)
+				panic(fmt.Errorf("fatal exit"))
 			}
 		}
 		if ncconfig.app_br_args != "-" {
 			err := preinitBuiltinAppConfig(ncconfig, ":br "+ncconfig.app_br_args)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%v\n", err)
-				os.Exit(1)
+				panic(fmt.Errorf("fatal exit"))
 			}
 		}
 		if ncconfig.app_httpserver_args != "-" {
 			err := preinitBuiltinAppConfig(ncconfig, ":httpserver "+ncconfig.app_br_args)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%v\n", err)
-				os.Exit(1)
+				panic(fmt.Errorf("fatal exit"))
 			}
 		}
 	}
@@ -475,7 +485,7 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 		xconfig, err := ProxyClientConfigByCommandline(ncconfig.proxyProt, ncconfig.auth, xcommandline)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error init proxy config: %v\n", err)
-			os.Exit(1)
+			panic(fmt.Errorf("fatal exit"))
 		}
 		ncconfig.arg_proxyc_Config = xconfig
 	}
@@ -498,14 +508,14 @@ func configureSecurity(ncconfig *AppNetcatConfig) error {
 			panic(err)
 		}
 		fmt.Fprintf(os.Stdout, "%s\n", ncconfig.presharedKey)
-		os.Exit(1)
+		panic(fmt.Errorf("fatal exit"))
 	}
 	if ncconfig.presharedKey != "" {
 		if strings.HasPrefix(ncconfig.presharedKey, "@") {
 			ncconfig.presharedKey, err = secure.ReadPSKFile(ncconfig.presharedKey)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error reading PSK file: %v\n", err)
-				os.Exit(1)
+				panic(fmt.Errorf("fatal exit"))
 			}
 		}
 	}
@@ -587,7 +597,7 @@ func determineNetworkAndAddress(ncconfig *AppNetcatConfig) (network, host, port,
 				P2PSessionKey, err = secure.ReadPSKFile(P2PSessionKey)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error reading PSK file: %v\n", err)
-					os.Exit(1)
+					panic(fmt.Errorf("fatal exit"))
 				}
 			}
 			if P2PSessionKey == "." {
@@ -1321,7 +1331,7 @@ func init_TLS(ncconfig *AppNetcatConfig, genCertForced bool) []tls.Certificate {
 				cert, err := secure.LoadCertificate(ncconfig.sslCertFile, ncconfig.sslKeyFile)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error load certificate: %v\n", err)
-					os.Exit(1)
+					panic(fmt.Errorf("fatal exit"))
 				}
 				certs = append(certs, *cert)
 				ncconfig.tlsECCertEnabled = false
@@ -1329,7 +1339,7 @@ func init_TLS(ncconfig *AppNetcatConfig, genCertForced bool) []tls.Certificate {
 			} else {
 				if !ncconfig.tlsECCertEnabled && !ncconfig.tlsRSACertEnabled {
 					fmt.Fprintf(os.Stderr, "EC and RSA both are disabled\n")
-					os.Exit(1)
+					panic(fmt.Errorf("fatal exit"))
 				}
 				if ncconfig.tlsECCertEnabled {
 					if ncconfig.presharedKey != "" {
@@ -1340,7 +1350,7 @@ func init_TLS(ncconfig *AppNetcatConfig, genCertForced bool) []tls.Certificate {
 					cert, err := secure.GenerateECDSACertificate(ncconfig.tlsSNI, ncconfig.presharedKey)
 					if err != nil {
 						fmt.Fprintf(os.Stderr, "Error generating EC certificate: %v\n", err)
-						os.Exit(1)
+						panic(fmt.Errorf("fatal exit"))
 					}
 					certs = append(certs, *cert)
 				}
@@ -1349,7 +1359,7 @@ func init_TLS(ncconfig *AppNetcatConfig, genCertForced bool) []tls.Certificate {
 					cert, err := secure.GenerateRSACertificate(ncconfig.tlsSNI)
 					if err != nil {
 						fmt.Fprintf(os.Stderr, "Error generating RSA certificate: %v\n", err)
-						os.Exit(1)
+						panic(fmt.Errorf("fatal exit"))
 					}
 					certs = append(certs, *cert)
 				}
@@ -1462,59 +1472,59 @@ func usage_less(argv0 string) {
 func conflictCheck(ncconfig *AppNetcatConfig) {
 	if ncconfig.sendfile != "" && ncconfig.runCmd != "" {
 		fmt.Fprintf(os.Stderr, "-send and -exec cannot be used together\n")
-		os.Exit(1)
+		panic(fmt.Errorf("fatal exit"))
 	}
 	if ncconfig.enablePty && ncconfig.enableCRLF {
 		fmt.Fprintf(os.Stderr, "-pty and -C cannot be used together\n")
-		os.Exit(1)
+		panic(fmt.Errorf("fatal exit"))
 	}
 	if ncconfig.proxyAddr != "" && ncconfig.useSTUN {
 		fmt.Fprintf(os.Stderr, "-stun and -x cannot be used together\n")
-		os.Exit(1)
+		panic(fmt.Errorf("fatal exit"))
 	}
 	if ncconfig.proxyProt == "connect" && (ncconfig.udpProtocol || ncconfig.kcpEnabled || ncconfig.kcpSEnabled) {
 		fmt.Fprintf(os.Stderr, "http proxy and udp cannot be used together\n")
-		os.Exit(1)
+		panic(fmt.Errorf("fatal exit"))
 	}
 	if ncconfig.listenMode && (ncconfig.remoteAddr != "" || ncconfig.autoP2P != "") {
 		fmt.Fprintf(os.Stderr, "-l and (-remote -p2p) cannot be used together\n")
-		os.Exit(1)
+		panic(fmt.Errorf("fatal exit"))
 	}
 	if ncconfig.presharedKey != "" && (ncconfig.tlsRSACertEnabled || (ncconfig.sslCertFile != "" && ncconfig.sslKeyFile != "")) {
 		fmt.Fprintf(os.Stderr, "-psk and (-tlsrsa -ssl-cert -ssl-key) cannot be used together\n")
-		os.Exit(1)
+		panic(fmt.Errorf("fatal exit"))
 	}
 	if ncconfig.useIPv4 && ncconfig.useIPv6 {
 		fmt.Fprintf(os.Stderr, "-4 and -6 cannot be used together\n")
-		os.Exit(1)
+		panic(fmt.Errorf("fatal exit"))
 	}
 	if ncconfig.useUNIXdomain && (ncconfig.useIPv6 || ncconfig.useIPv4 || ncconfig.useSTUN || ncconfig.udpProtocol || ncconfig.kcpEnabled || ncconfig.kcpSEnabled || ncconfig.localbind != "" || ncconfig.proxyAddr != "") {
 		fmt.Fprintf(os.Stderr, "-U and (-4 -6 -stun -u -kcp -kcps -bind -x) cannot be used together\n")
-		os.Exit(1)
+		panic(fmt.Errorf("fatal exit"))
 	}
 	if ncconfig.runAppFileServ != "" && (ncconfig.appMuxListenMode || ncconfig.appMuxListenOn != "") {
 		fmt.Fprintf(os.Stderr, "-httpserver and (-httplocal -download) cannot be used together\n")
-		os.Exit(1)
+		panic(fmt.Errorf("fatal exit"))
 	}
 	if (ncconfig.sslCertFile != "" && ncconfig.sslKeyFile == "") || (ncconfig.sslCertFile == "" && ncconfig.sslKeyFile != "") {
 		fmt.Fprintf(os.Stderr, "-ssl-cert and -ssl-key both must be set, only one given")
-		os.Exit(1)
+		panic(fmt.Errorf("fatal exit"))
 	}
 	if (ncconfig.sslCertFile != "" && ncconfig.sslKeyFile != "") && !isTLSEnabled(ncconfig) {
 		fmt.Fprintf(os.Stderr, "-ssl-cert and -ssl-key set without -tls ?")
-		os.Exit(1)
+		panic(fmt.Errorf("fatal exit"))
 	}
 	if (ncconfig.sslCertFile != "" && ncconfig.sslKeyFile != "") && (ncconfig.autoP2P != "") {
 		fmt.Fprintf(os.Stderr, "(-ssl-cert -ssl-key) and (-p2p -p2p-tcp) cannot be used together")
-		os.Exit(1)
+		panic(fmt.Errorf("fatal exit"))
 	}
 	if ncconfig.kcpBridgeMode && ncconfig.portRotate {
 		fmt.Fprintf(os.Stderr, "-kcpbr and -port-rotate cannot be used together")
-		os.Exit(1)
+		panic(fmt.Errorf("fatal exit"))
 	}
 	if ncconfig.kcpBridgeMode && ncconfig.autoP2P == "" {
 		fmt.Fprintf(os.Stderr, "-kcpbr and -p2p must be used together")
-		os.Exit(1)
+		panic(fmt.Errorf("fatal exit"))
 	}
 }
 
