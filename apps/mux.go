@@ -3,15 +3,16 @@ package apps
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/yamux"
@@ -32,7 +33,15 @@ var (
 	VarMuxKeepAliveTimeout    int   = DefaultVarMuxKeepAliveTimeout
 )
 
+var GlobalPortRegistry sync.Map
+
+type PortOwner struct {
+	OwnerID  string       // 客户端指纹
+	Listener net.Listener // 监听句柄
+}
+
 type AppMuxConfig struct {
+	Logger           *log.Logger
 	Engine           string
 	AppMode          string
 	Port             string   // listen port
@@ -57,6 +66,16 @@ type ChanError struct {
 
 type muxListener struct {
 	session interface{}
+	raddr   string
+	laddr   string
+}
+
+func newMuxListener(session interface{}) *muxListener {
+	return &muxListener{
+		session: session,
+		raddr:   muxSessionRemoteAddr(session),
+		laddr:   muxSessionLocalAddr(session),
+	}
 }
 
 func (m *muxListener) Accept() (net.Conn, error) {
@@ -75,7 +94,7 @@ func (m *muxListener) Accept() (net.Conn, error) {
 		return nil, err
 	}
 
-	return &streamWrapper{Conn: stream}, nil
+	return newStreamWrapper(stream, m.raddr, m.laddr), nil
 }
 
 func (m *muxListener) Close() error {
@@ -95,6 +114,22 @@ func (m *muxListener) Addr() net.Addr {
 
 type streamWrapper struct {
 	net.Conn
+	raddr string
+	laddr string
+}
+
+func newStreamWrapper(conn net.Conn, remoteAddr, localAddr string) *streamWrapper {
+	if remoteAddr == "" {
+		remoteAddr = "remote"
+	}
+	if localAddr == "" {
+		localAddr = "local"
+	}
+	return &streamWrapper{
+		Conn:  conn,
+		raddr: remoteAddr,
+		laddr: localAddr,
+	}
 }
 
 func (s *streamWrapper) CloseWrite() error {
@@ -102,11 +137,11 @@ func (s *streamWrapper) CloseWrite() error {
 }
 
 func (s *streamWrapper) LocalAddr() net.Addr {
-	return misc.DummyAddr("local")
+	return misc.DummyAddr(s.laddr)
 }
 
 func (s *streamWrapper) RemoteAddr() net.Addr {
-	return misc.DummyAddr("remote")
+	return misc.DummyAddr(s.raddr)
 }
 
 func (s *streamWrapper) SetDeadline(t time.Time) error {
@@ -141,18 +176,19 @@ func bidirectionalCopy(local io.ReadWriteCloser, stream io.ReadWriteCloser) {
 	}
 }
 
-func App_mux_usage() {
-	fmt.Fprintln(os.Stderr, "Usage:")
-	fmt.Fprintln(os.Stderr, "   :mux socks5")
-	fmt.Fprintln(os.Stderr, "   :mux linkagent")
-	fmt.Fprintln(os.Stderr, "   :mux link <L-Config>;<R-Config> (e.g. mux link x://127.0.0.1:8000;none)")
-	fmt.Fprintln(os.Stderr, "   :mux httpserver <rootDir1> <rootDir2>...")
-	fmt.Fprintln(os.Stderr, "   :mux httpclient <saveDir> <remotePath>")
-	fmt.Fprintln(os.Stderr, "   :mux -l listen_port")
+func App_mux_usage(logWriter io.Writer) {
+	fmt.Fprintln(logWriter, "Usage:")
+	fmt.Fprintln(logWriter, "   :mux socks5")
+	fmt.Fprintln(logWriter, "   :mux linkagent")
+	fmt.Fprintln(logWriter, "   :mux link <L-Config>;<R-Config> (e.g. mux link x://127.0.0.1:8000;none)")
+	fmt.Fprintln(logWriter, "   :mux httpserver <rootDir1> <rootDir2>...")
+	fmt.Fprintln(logWriter, "   :mux httpclient <saveDir> <remotePath>")
+	fmt.Fprintln(logWriter, "   :mux -l listen_port")
 }
 
-func AppMuxConfigByArgs(args []string) (*AppMuxConfig, error) {
+func AppMuxConfigByArgs(logWriter io.Writer, args []string) (*AppMuxConfig, error) {
 	config := &AppMuxConfig{
+		Logger:           misc.NewLog(logWriter, "[:mux] ", log.LstdFlags|log.Lmsgprefix),
 		Engine:           VarmuxEngine,
 		KeepAliveTimeout: VarMuxKeepAliveTimeout,
 	}
@@ -266,13 +302,13 @@ func App_mux_main_withconfig(conn net.Conn, config *AppMuxConfig) {
 		SessionConn:  conn,
 	}
 
-	err := handleMuxSession(cfg)
+	err := handleMuxSession(&cfg)
 	if err != nil {
-		log.Printf(":mux: %v\n", err)
+		config.Logger.Printf(":mux: %v\n", err)
 	}
 }
 
-func handleMuxSession(cfg MuxSessionConfig) error {
+func handleMuxSession(cfg *MuxSessionConfig) error {
 	switch cfg.AppMode {
 	case "listen":
 		return handleListenMode(cfg, nil, nil)
@@ -366,20 +402,20 @@ func parseLinkConfig(conf string) (string, string, url.Values, error) {
 // linkRuntimeConfig 保存预处理后的运行参数
 // 这里的字段是从 url.Values 解析出来的，用于 runLinkListener 直接使用
 type linkRuntimeConfig struct {
-	UseTLS        bool
-	NtConfig      *secure.NegotiationConfig
-	UseTProxy     bool
-	Username      string
-	Password      string
-	TargetHost    string
-	TargetPort    int
-	ForwardTarget string
-	MagicTargetIP string // 仅用于 TProxy 模式下的上下文判断
+	UseTLS              bool
+	NtConfig            *secure.NegotiationConfig
+	UseTProxy           bool
+	TProxyAllowPublicIP bool
+	Username            string
+	Password            string
+	TargetHost          string
+	TargetPort          int
+	ForwardTarget       string
 }
 
 // setupLinkRuntimeConfig 负责在 Accept 之前完成所有配置分析、TLS加载和参数校验
 // 如果这一步返回 nil error，说明配置完全可用，可以放心地回复 OK
-func setupLinkRuntimeConfig(scheme string, params url.Values, ln net.Listener) (*linkRuntimeConfig, error) {
+func setupLinkRuntimeConfig(muxcfg *MuxSessionConfig, scheme string, params url.Values, ln net.Listener) (*linkRuntimeConfig, error) {
 	cfg := &linkRuntimeConfig{}
 	var err error
 	var cert *tls.Certificate
@@ -414,17 +450,23 @@ func setupLinkRuntimeConfig(scheme string, params url.Values, ln net.Listener) (
 		if params.Get("tproxy") == "1" {
 			cfg.UseTProxy = true
 		}
+		switch params.Get("allow") {
+		case "any", "domain":
+			cfg.TProxyAllowPublicIP = true
+		case "private":
+			cfg.TProxyAllowPublicIP = false
+		}
 		cfg.Username = params.Get("_user")
 		cfg.Password = params.Get("_password")
 
-		log.Printf("[link-x] Listening on %s (TProxy=%v)\n", ln.Addr().String(), cfg.UseTProxy)
+		muxcfg.Logger.Printf("[link-x] Listening on %s (TProxy=%v)\n", ln.Addr().String(), cfg.UseTProxy)
 		if cfg.UseTProxy {
 			donotUsePublicMagicDNS := IsValidABC0IP(MagicDNServer)
 			if donotUsePublicMagicDNS {
 				targetIpPref := strings.TrimRight(MagicDNServer, ".0")
-				log.Printf("   TProxy Format: 127.1.13.61:%s -> %s.1:3389\n", actualListenPort, targetIpPref)
+				muxcfg.Logger.Printf("   TProxy Format: 127.1.13.61:%s -> %s.1:3389\n", actualListenPort, targetIpPref)
 			} else {
-				log.Printf("   TProxy Format: 10.0.0.1-3389.%s:%s -> 10.0.0.1:3389\n", MagicDNServer, actualListenPort)
+				muxcfg.Logger.Printf("   TProxy Format: 10.0.0.1-3389.%s:%s -> 10.0.0.1:3389\n", MagicDNServer, actualListenPort)
 			}
 		}
 	case "f":
@@ -438,11 +480,11 @@ func setupLinkRuntimeConfig(scheme string, params url.Values, ln net.Listener) (
 			return nil, fmt.Errorf("invalid target address '%s': %v", cfg.ForwardTarget, err)
 		}
 		cfg.TargetPort, _ = strconv.Atoi(pStr)
-		log.Printf("[link-f] Listening on %s -> Forward to %s\n", ln.Addr().String(), cfg.ForwardTarget)
+		muxcfg.Logger.Printf("[link-f] Listening on %s -> Forward to %s\n", ln.Addr().String(), cfg.ForwardTarget)
 	case "raw":
-		log.Printf("[listen] Listening on %s\n", ln.Addr().String())
+		muxcfg.Logger.Printf("[listen] Listening on %s\n", ln.Addr().String())
 		if params.Get("mode") == "httpserver" {
-			log.Printf("You can open http://127.0.0.1:%s in your browser\n", actualListenPort)
+			muxcfg.Logger.Printf("You can open http://127.0.0.1:%s in your browser\n", actualListenPort)
 		}
 	}
 
@@ -451,8 +493,15 @@ func setupLinkRuntimeConfig(scheme string, params url.Values, ln net.Listener) (
 
 // runLinkListener 核心运行循环
 // 注意：现在它接收预处理好的 *linkRuntimeConfig，不再进行配置解析
-func runLinkListener(session interface{}, ln net.Listener, scheme string, rtConfig *linkRuntimeConfig, doneChan <-chan struct{}) error {
+func runLinkListener(muxcfg *MuxSessionConfig, session interface{}, ln net.Listener, scheme string, rtConfig *linkRuntimeConfig, doneChan <-chan struct{}) error {
 	defer ln.Close()
+
+	s5config := Socks5uConfig{
+		Logger:     muxcfg.Logger,
+		Username:   rtConfig.Username,
+		Password:   rtConfig.Password,
+		AccessCtrl: muxcfg.AccessCtrl,
+	}
 
 	// 监听 doneChan (Session 死则 Listener 死)
 	go func() {
@@ -466,7 +515,7 @@ func runLinkListener(session interface{}, ln net.Listener, scheme string, rtConf
 		if rtConfig.UseTLS {
 			nconn, err := secure.DoNegotiation(rtConfig.NtConfig, c, io.Discard)
 			if err != nil {
-				log.Println("[link-x] TLS negotiation failed:", err)
+				muxcfg.Logger.Println("[link-x] TLS negotiation failed:", err)
 				c.Close()
 				return
 			}
@@ -478,10 +527,10 @@ func runLinkListener(session interface{}, ln net.Listener, scheme string, rtConf
 
 		stream, err := openMuxStream(session)
 		if err != nil {
-			log.Println("mux Open failed:", err)
+			muxcfg.Logger.Println("mux Open failed:", err)
 			return
 		}
-		streamWithCloseWrite := &streamWrapper{Conn: stream}
+		streamWithCloseWrite := newStreamWrapper(stream, muxSessionRemoteAddr(session), muxSessionLocalAddr(session))
 		defer streamWithCloseWrite.Close()
 
 		if scheme == "raw" {
@@ -499,15 +548,15 @@ func runLinkListener(session interface{}, ln net.Listener, scheme string, rtConf
 			// x://
 			if rtConfig.UseTProxy && magicIP != "" {
 				cmd = "T-CONNECT"
-				tHost, tPort, err = DNSLookupMagicIP(magicIP, false)
+				tHost, tPort, err = DNSLookupMagicIP(magicIP, rtConfig.TProxyAllowPublicIP)
 				if err != nil {
-					log.Println("MagicIP lookup failed:", err)
+					muxcfg.Logger.Println("MagicIP lookup failed:", err)
 					return
 				}
 			}
 		}
 
-		ServeProxyOnTunnel(c, keyingMaterial, streamWithCloseWrite, cmd, rtConfig.Username, rtConfig.Password, tHost, tPort)
+		ServeProxyOnTunnel(&s5config, c, keyingMaterial, streamWithCloseWrite, cmd, tHost, tPort)
 	}
 
 	for {
@@ -539,41 +588,41 @@ func runLinkListener(session interface{}, ln net.Listener, scheme string, rtConf
 	}
 }
 
-// runLinkSessionWithHandshake 提取的公共逻辑：握手 -> 建Session -> 启动业务
-// 此函数假定 Hello 已经被读取并确认为 "linkagent"
-func runLinkSessionWithHandshake(cfg MuxSessionConfig, lConf string, rConf string) error {
-	// 提前解析 Local Config，以便正确设置 localActive
+// runLinkSessionWithHandshake 客户端握手逻辑
+func runLinkSessionWithHandshake(cfg *MuxSessionConfig, lConf string, rConf string) error {
+	// 提前解析 Local Config
 	lScheme, lHost, lParams, err := parseLinkConfig(lConf)
 	if err != nil {
 		return fmt.Errorf("local config parse error: %v", err)
 	}
 
-	// 1. 发送 R 配置给远端
-	// LocalActive 表示本地有业务，远端可以发送流过来
-	// 注意：如果 lConf 是 "none?outbound_bind=..."，Scheme 也是 "none"，
 	localActive := "0"
 	if lScheme != "none" {
 		localActive = "1"
 	}
 
 	sendConf := rConf
-	if sendConf == "none" {
-		sendConf = fmt.Sprintf("none?peer_active=%s", localActive)
-	} else {
-		if strings.Contains(sendConf, "?") {
-			sendConf += fmt.Sprintf("&peer_active=%s", localActive)
-		} else {
-			sendConf += fmt.Sprintf("?peer_active=%s", localActive)
-		}
+	separator := "?"
+	if strings.Contains(sendConf, "?") {
+		separator = "&"
+	}
+	sendConf += fmt.Sprintf("%speer_active=%s", separator, localActive)
+	separator = "&"
+
+	if !strings.HasPrefix(rConf, "none") {
+		// 追加 owner 参数
+		fingerprint := GenerateNetworkFingerprint(cfg.SessionConn.LocalAddr().String())
+		sendConf += fmt.Sprintf("%sowner=%s", separator, fingerprint)
 	}
 	sendConf += "\n"
+	// -------------------------------------------------------------
 
-	log.Printf("[link] Sending Remote Config: %s", strings.TrimSpace(sendConf))
+	cfg.Logger.Printf("[link] Sending R-Config: %s", strings.TrimSpace(sendConf))
 	if _, err := cfg.SessionConn.Write([]byte(sendConf)); err != nil {
 		return fmt.Errorf("failed to send remote config: %v", err)
 	}
 
-	log.Printf("[link] Waiting for Remote ACK...")
+	cfg.Logger.Printf("[link] Waiting for Remote ACK...")
 
 	// 2. 等待 ACK
 	ack, err := netx.ReadString(cfg.SessionConn, '\n', 1024)
@@ -584,22 +633,19 @@ func runLinkSessionWithHandshake(cfg MuxSessionConfig, lConf string, rConf strin
 	if !strings.HasPrefix(ack, "OK") {
 		return fmt.Errorf("remote link failed: %s", ack)
 	}
-	log.Printf("[link] Remote ready (%s).", ack)
+	cfg.Logger.Printf("[link] Remote ready (%s).", ack)
 
 	cfg.SessionConn.SetDeadline(time.Time{})
 
-	// 3. 创建 Session
 	session, err := createMuxSession(cfg.Engine, cfg.SessionConn, true)
 	if err != nil {
 		return err
 	}
 
-	// 4. 启动 Session 监控 (兼任 AcceptLoop)
 	remoteActive := !strings.HasPrefix(rConf, "none")
 	sessionDone := make(chan struct{})
 	go func() {
-		// 如果 remoteActive 为 false，说明单向模式，这里设置为 drainOnly=true
-		startRemoteStreamAcceptLoop(session, lParams.Get("outbound_bind"), cfg.AccessCtrl, !remoteActive)
+		startRemoteStreamAcceptLoop(cfg, session, lParams.Get("outbound_bind"), !remoteActive)
 		close(sessionDone)
 	}()
 
@@ -610,15 +656,14 @@ func runLinkSessionWithHandshake(cfg MuxSessionConfig, lConf string, rConf strin
 			return fmt.Errorf("local bind failed: %v", err)
 		}
 
-		// 关键改动：先初始化 Config，再运行
-		rtConfig, err := setupLinkRuntimeConfig(lScheme, lParams, ln)
+		rtConfig, err := setupLinkRuntimeConfig(cfg, lScheme, lParams, ln)
 		if err != nil {
 			ln.Close()
 			return fmt.Errorf("local config setup failed: %v", err)
 		}
 
-		log.Printf("[link] Local service started.")
-		return runLinkListener(session, ln, lScheme, rtConfig, sessionDone)
+		cfg.Logger.Printf("[link] Local service started.")
+		return runLinkListener(cfg, session, ln, lScheme, rtConfig, sessionDone)
 	}
 
 	<-sessionDone
@@ -626,8 +671,8 @@ func runLinkSessionWithHandshake(cfg MuxSessionConfig, lConf string, rConf strin
 }
 
 // handleLinkMode (Local)
-func handleLinkMode(cfg MuxSessionConfig) error {
-	log.Println("Waiting for linkagent handshake...")
+func handleLinkMode(cfg *MuxSessionConfig) error {
+	cfg.Logger.Println("Waiting for linkagent handshake...")
 	cfg.SessionConn.SetDeadline(time.Now().Add(60 * time.Second))
 
 	// 1. 读取 Hello
@@ -647,11 +692,11 @@ func handleLinkMode(cfg MuxSessionConfig) error {
 
 // handleListenMode 仅用于 -l 模式
 // 已增强：自动探测 peer 类型。如果是 linkagent，则构造虚拟配置复用 Link 流程。
-func handleListenMode(cfg MuxSessionConfig, notifyAddrChan chan<- string, done context.CancelFunc) error {
+func handleListenMode(cfg *MuxSessionConfig, notifyAddrChan chan<- string, done context.CancelFunc) error {
 	if done != nil {
 		defer done()
 	}
-	log.Println("Waiting for :mux handshake...")
+	cfg.Logger.Println("Waiting for :mux handshake...")
 	cfg.SessionConn.SetDeadline(time.Now().Add(60 * time.Second))
 
 	hello := make([]byte, 16)
@@ -677,7 +722,7 @@ func handleListenMode(cfg MuxSessionConfig, notifyAddrChan chan<- string, done c
 		}
 		rConf := "none"
 
-		log.Printf("[listen] Detected linkagent peer. Upgrading to link mode (L=%s, R=%s)", lConf, rConf)
+		cfg.Logger.Printf("[listen] Detected linkagent peer. Upgrading to link mode (L=%s, R=%s)", lConf, rConf)
 
 		return runLinkSessionWithHandshake(cfg, lConf, rConf)
 	}
@@ -695,7 +740,7 @@ func handleListenMode(cfg MuxSessionConfig, notifyAddrChan chan<- string, done c
 	// 单向模式：drainOnly = true
 	sessionDone := make(chan struct{})
 	go func() {
-		startRemoteStreamAcceptLoop(session, "", cfg.AccessCtrl, true)
+		startRemoteStreamAcceptLoop(cfg, session, "", true)
 		close(sessionDone)
 	}()
 
@@ -726,26 +771,22 @@ func handleListenMode(cfg MuxSessionConfig, notifyAddrChan chan<- string, done c
 	}
 
 	// 关键改动：调用 setupLinkRuntimeConfig
-	rtConfig, err := setupLinkRuntimeConfig(scheme, params, ln)
+	rtConfig, err := setupLinkRuntimeConfig(cfg, scheme, params, ln)
 	if err != nil {
 		ln.Close()
 		return fmt.Errorf("legacy setup failed: %v", err)
 	}
 
-	log.Printf("[listen] Service started (Legacy). PeerMode=%s", peerModeStr)
-	return runLinkListener(session, ln, scheme, rtConfig, sessionDone)
+	cfg.Logger.Printf("[listen] Service started (Legacy). PeerMode=%s", peerModeStr)
+	return runLinkListener(cfg, session, ln, scheme, rtConfig, sessionDone)
 }
 
 // handleLinkAgentMode (Remote)
-func handleLinkAgentMode(cfg MuxSessionConfig) error {
-	// 1. 发送 Hello
+func handleLinkAgentMode(cfg *MuxSessionConfig) error {
 	if err := sendHello(cfg.SessionConn, "linkagent"); err != nil {
 		return err
 	}
 
-	log.Printf("[linkagent] Receiving config request...")
-
-	// 2. 读取配置
 	cfg.SessionConn.SetReadDeadline(time.Now().Add(25 * time.Second))
 	reqStr, err := netx.ReadString(cfg.SessionConn, '\n', 1024)
 	if err != nil {
@@ -754,24 +795,8 @@ func handleLinkAgentMode(cfg MuxSessionConfig) error {
 	cfg.SessionConn.SetReadDeadline(time.Time{})
 
 	reqStr = strings.TrimSpace(reqStr)
-	log.Printf("[linkagent] Received config request: %s", reqStr)
-
 	rConf := reqStr
-	peerActive := false
-
-	if strings.HasPrefix(rConf, "none") {
-		if strings.Contains(rConf, "peer_active=1") {
-			peerActive = true
-		}
-		// 这里不能直接设为 "none"，否则会丢失可能的参数(如 outbound_bind)
-	} else {
-		u, err := url.Parse(rConf)
-		if err == nil {
-			if u.Query().Get("peer_active") == "1" {
-				peerActive = true
-			}
-		}
-	}
+	peerActive := strings.Contains(rConf, "peer_active=1")
 
 	rScheme, rHost, rParams, err := parseLinkConfig(rConf)
 	if err != nil {
@@ -779,12 +804,63 @@ func handleLinkAgentMode(cfg MuxSessionConfig) error {
 		return err
 	}
 
-	// 3. 准备环境 (Bind + Config Setup)
 	var ln net.Listener
 	var rtConfig *linkRuntimeConfig
 	ackMsg := "OK"
 
 	if rScheme != "none" {
+		// -------------------------------------------------------------
+		// [STEP 2] 严格的端口抢占安全检查
+		// -------------------------------------------------------------
+		ownerID := rParams.Get("owner") // 新请求带来的指纹
+
+		bindKey := rHost
+		if !strings.Contains(bindKey, ":") {
+			bindKey = ":" + bindKey
+		}
+
+		if val, loaded := GlobalPortRegistry.Load(bindKey); loaded {
+			oldOwner := val.(*PortOwner)
+
+			// 默认拒绝
+			canPreempt := false
+
+			if oldOwner.OwnerID == "" {
+				// 情况 A: 旧连接是 Legacy 版 (没有指纹)
+				// 逻辑: "旧版无法被踢"。即便是新版也不允许踢旧版。
+				// 必须等旧版自己断开。
+				cfg.Logger.Printf("[mux] Port %s is held by Legacy client. Preemption DENIED.", bindKey)
+				canPreempt = false
+			} else {
+				// 情况 B: 旧连接是 New 版 (有指纹)
+				// 逻辑: "新版有owner，按照认证匹配才能踢"
+				// 必须两个指纹都存在且相等
+				if ownerID != "" && ownerID == oldOwner.OwnerID {
+					cfg.Logger.Printf("[mux] Port %s owner match (%s). Allowing preemption.", bindKey, ownerID)
+					canPreempt = true
+				} else {
+					// 指纹不匹配，或者新请求没带指纹
+					cfg.Logger.Printf("[mux] Port %s locked by %s. Rejecting %s.", bindKey, oldOwner.OwnerID, ownerID)
+					canPreempt = false
+				}
+			}
+
+			if !canPreempt {
+				errMsg := fmt.Sprintf("ERROR: Port %s is locked. Preemption denied.\n", bindKey)
+				cfg.SessionConn.Write([]byte(errMsg))
+				return fmt.Errorf("port conflict: permission denied")
+			}
+
+			// 验证通过，执行踢人
+			cfg.Logger.Printf("[mux] Preempting port %s...", bindKey)
+			if oldOwner.Listener != nil {
+				oldOwner.Listener.Close() // 这会强制旧 Session 退出
+			}
+			GlobalPortRegistry.Delete(bindKey)
+			time.Sleep(1 * time.Second)
+		}
+		// -------------------------------------------------------------
+
 		// 3.1 绑定端口
 		enableTProxy := (rScheme == "x" && rParams.Get("tproxy") == "1")
 		ln, err = prepareLocalListener(rHost, enableTProxy)
@@ -793,34 +869,47 @@ func handleLinkAgentMode(cfg MuxSessionConfig) error {
 			return err
 		}
 
-		// 3.2 优化点：在发送 OK 之前，进行 Config 分析 (TLS加载, Scheme检查等)
-		rtConfig, err = setupLinkRuntimeConfig(rScheme, rParams, ln)
+		// 3.2 配置分析
+		rtConfig, err = setupLinkRuntimeConfig(cfg, rScheme, rParams, ln)
 		if err != nil {
-			// 如果 Setup 失败（比如证书加载失败），关闭 Listener 并回复 ERROR
 			ln.Close()
 			errMsg := fmt.Sprintf("ERROR: config setup failed: %v\n", err)
 			cfg.SessionConn.Write([]byte(errMsg))
 			return err
 		}
 
-		// 绑定且配置成功，准备回复 OK
-		ackMsg = fmt.Sprintf("OK:%s", ln.Addr().String())
+		// 3.3 注册当前客户端
+		actualAddr := ln.Addr().String()
+		newOwnerEntry := &PortOwner{
+			OwnerID:  ownerID,
+			Listener: ln,
+		}
+		GlobalPortRegistry.Store(bindKey, newOwnerEntry)
+
+		// 退出时清理 Map (防止僵尸条目)
+		// 只有当 Map 里的还是我自己时才删
+		defer func() {
+			if v, ok := GlobalPortRegistry.Load(bindKey); ok {
+				if v.(*PortOwner) == newOwnerEntry {
+					GlobalPortRegistry.Delete(bindKey)
+				}
+			}
+		}()
+
+		ackMsg = fmt.Sprintf("OK:%s", actualAddr)
 	} else {
 		ackMsg = "OK:none"
 	}
 
-	// 4. 创建 Session
 	session, err := createMuxSession(cfg.Engine, cfg.SessionConn, false)
 	if err != nil {
 		if ln != nil {
 			ln.Close()
 		}
-		errMsg := fmt.Sprintf("ERROR: createMuxSession failed: %v\n", err)
-		cfg.SessionConn.Write([]byte(errMsg))
+		cfg.SessionConn.Write([]byte(fmt.Sprintf("ERROR: createMuxSession failed: %v\n", err)))
 		return err
 	}
 
-	// 5. 发送 ACK
 	if _, err := cfg.SessionConn.Write([]byte(ackMsg + "\n")); err != nil {
 		if ln != nil {
 			ln.Close()
@@ -828,18 +917,16 @@ func handleLinkAgentMode(cfg MuxSessionConfig) error {
 		return err
 	}
 
-	log.Printf("[linkagent] Session established.")
+	cfg.Logger.Printf("[linkagent] Session established. OwnerID=%s", rParams.Get("owner"))
 
-	// 6. 启动 Session 监控
 	sessionDone := make(chan struct{})
 	go func() {
-		startRemoteStreamAcceptLoop(session, rParams.Get("outbound_bind"), cfg.AccessCtrl, !peerActive)
+		startRemoteStreamAcceptLoop(cfg, session, rParams.Get("outbound_bind"), !peerActive)
 		close(sessionDone)
 	}()
 
 	if rScheme != "none" && ln != nil {
-		// 这里传入预处理好的 rtConfig
-		return runLinkListener(session, ln, rScheme, rtConfig, sessionDone)
+		return runLinkListener(cfg, session, ln, rScheme, rtConfig, sessionDone)
 	}
 
 	<-sessionDone
@@ -850,7 +937,7 @@ func handleLinkAgentMode(cfg MuxSessionConfig) error {
 // Legacy & Common Handlers
 // -----------------------------------------------------------------------------
 
-func handleHTTPClientMode(cfg MuxSessionConfig) error {
+func handleHTTPClientMode(cfg *MuxSessionConfig) error {
 	cfg.Port = "0"
 	serverURL := ""
 	listenAddrChan := make(chan string, 1)
@@ -873,19 +960,19 @@ func handleHTTPClientMode(cfg MuxSessionConfig) error {
 			DryRun:                 false,
 			Verbose:                false,
 			LogLevel:               httpfileshare.LogLevelError,
-			LoggerOutput:           os.Stderr,
-			ProgressOutput:         os.Stderr,
+			LoggerOutput:           cfg.Logger.Writer(),
+			ProgressOutput:         cfg.Logger.Writer(),
 			ProgressUpdateInterval: 1 * time.Second,
 			NoCompress:             *VarhttpDownloadNoCompress,
 		}
 
 		c, err := httpfileshare.NewClient(httpcfg)
 		if err != nil {
-			log.Printf("Failed to create HTTP client: %v\n", err)
+			cfg.Logger.Printf("Failed to create HTTP client: %v\n", err)
 			return err
 		}
 		if err := c.Start(ctx); err != nil {
-			log.Printf("Client operation failed: %v\n", err)
+			cfg.Logger.Printf("Client operation failed: %v\n", err)
 			return err
 		}
 		<-ctx.Done()
@@ -894,8 +981,13 @@ func handleHTTPClientMode(cfg MuxSessionConfig) error {
 }
 
 // startRemoteStreamAcceptLoop 从 mux session 接受流并处理 SOCKS5 请求
-func startRemoteStreamAcceptLoop(session interface{}, localbind string, accessCtrl *acl.ACL, drainOnly bool) error {
-	listener := &muxListener{session}
+func startRemoteStreamAcceptLoop(cfg *MuxSessionConfig, session interface{}, localbind string, drainOnly bool) error {
+	listener := newMuxListener(session)
+	s5config := Socks5uConfig{
+		Logger:     cfg.Logger,
+		AccessCtrl: cfg.AccessCtrl,
+		Localbind:  localbind,
+	}
 	for {
 		stream, err := listener.Accept()
 		if err != nil {
@@ -910,7 +1002,7 @@ func startRemoteStreamAcceptLoop(session interface{}, localbind string, accessCt
 			continue
 		}
 
-		go handleSocks5ClientOnStream(stream, localbind, accessCtrl)
+		go handleSocks5ClientOnStream(&s5config, stream)
 	}
 }
 
@@ -969,7 +1061,7 @@ func prepareLocalListener(listenAddrConf string, enableTProxy bool) (net.Listene
 	return ln, nil
 }
 
-func handleSocks5uMode(cfg MuxSessionConfig) error {
+func handleSocks5uMode(cfg *MuxSessionConfig) error {
 	if err := sendHello(cfg.SessionConn, cfg.AppMode); err != nil {
 		return err
 	}
@@ -979,13 +1071,13 @@ func handleSocks5uMode(cfg MuxSessionConfig) error {
 		return fmt.Errorf("create mux session failed: %v", err)
 	}
 
-	log.Printf("[socks5] tunnel server ready on mux session(%s).", cfg.SessionConn.RemoteAddr().String())
-	err = startRemoteStreamAcceptLoop(session, "", cfg.AccessCtrl, false)
-	log.Printf("[socks5] finished(%s).", cfg.SessionConn.RemoteAddr().String())
+	cfg.Logger.Printf("[socks5] tunnel server ready on mux session(%s).", cfg.SessionConn.RemoteAddr().String())
+	err = startRemoteStreamAcceptLoop(cfg, session, "", false)
+	cfg.Logger.Printf("[socks5] finished(%s).", cfg.SessionConn.RemoteAddr().String())
 	return err
 }
 
-func handleHTTPServerMode(cfg MuxSessionConfig) error {
+func handleHTTPServerMode(cfg *MuxSessionConfig) error {
 	if err := sendHello(cfg.SessionConn, cfg.AppMode); err != nil {
 		return err
 	}
@@ -995,22 +1087,22 @@ func handleHTTPServerMode(cfg MuxSessionConfig) error {
 		return err
 	}
 
-	ln := &muxListener{session}
+	ln := newMuxListener(session)
 	enableZstd := true
 
 	srvcfg := httpfileshare.ServerConfig{
 		RootPaths:    cfg.HttpServerVDirs,
-		LoggerOutput: os.Stderr,
+		LoggerOutput: cfg.Logger.Writer(),
 		EnableZstd:   enableZstd,
 		Listener:     ln,
 	}
 
 	server, err := httpfileshare.NewServer(srvcfg)
 	if err != nil {
-		log.Fatalf("Failed to create server: %v", err)
+		cfg.Logger.Fatalf("Failed to create server: %v", err)
 	}
 
-	log.Println("httpserver ready on mux")
+	cfg.Logger.Println("httpserver ready on mux")
 
 	return server.Start()
 }
@@ -1067,4 +1159,98 @@ func openMuxStream(session interface{}) (net.Conn, error) {
 	default:
 		return nil, fmt.Errorf("unknown session type")
 	}
+}
+
+func muxSessionLocalAddr(session interface{}) string {
+	var addr net.Addr
+	switch s := session.(type) {
+	case *yamux.Session:
+		addr = s.LocalAddr()
+	case *smux.Session:
+		addr = s.LocalAddr()
+	default:
+		return ""
+	}
+	if addr != nil {
+		return addr.String()
+	} else {
+		return ""
+	}
+}
+
+func muxSessionRemoteAddr(session interface{}) string {
+	var addr net.Addr
+	switch s := session.(type) {
+	case *yamux.Session:
+		addr = s.RemoteAddr()
+	case *smux.Session:
+		addr = s.RemoteAddr()
+	default:
+		return ""
+	}
+	if addr != nil {
+		return addr.String()
+	} else {
+		return ""
+	}
+}
+
+// GenerateNetworkFingerprint 生成纯网络特征指纹 (无 Hostname/Username)
+func GenerateNetworkFingerprint(localAddr string) string {
+	// 1. 获取出口网卡特征 (MAC 或 接口名)
+	netIdentity := getOutboundInterfaceIdentity(localAddr)
+
+	// 2. 生成 SHA256 哈希 (仅依赖网络身份)
+	// 加一个固定的盐值 (Salt) 防止彩虹表，虽然这里没传密码，但好习惯
+	raw := fmt.Sprintf("mux_salt_v1|%s", netIdentity)
+	hash := sha256.Sum256([]byte(raw))
+
+	// 返回前 16 位 Hex
+	return fmt.Sprintf("%x", hash)[:16]
+}
+
+// getOutboundInterfaceIdentity 获取出口网卡的唯一标识 (MAC 或 Name+Index)
+func getOutboundInterfaceIdentity(localAddr string) string {
+	localIP, _, err := net.SplitHostPort(localAddr)
+	if err != nil {
+		return getFallbackIdentity("")
+	}
+
+	ifaces, _ := net.Interfaces()
+	for _, iface := range ifaces {
+		addrs, _ := iface.Addrs()
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+
+			if ip.String() == localIP {
+				// 优先返回 MAC
+				if len(iface.HardwareAddr) > 0 {
+					return fmt.Sprintf("%s|%s|a", localIP, iface.HardwareAddr.String())
+				}
+				// VPN/Tun 接口无 MAC，返回 "Name"
+				return fmt.Sprintf("%s|%s|b", localIP, iface.Name)
+			}
+		}
+	}
+	return getFallbackIdentity(localIP)
+}
+
+// getFallbackIdentity 兜底方案
+func getFallbackIdentity(localIP string) string {
+	ifaces, _ := net.Interfaces()
+	for _, i := range ifaces {
+		if i.Flags&net.FlagLoopback == 0 && len(i.HardwareAddr) > 0 {
+			return fmt.Sprintf("%s|%s|c", localIP, i.HardwareAddr.String())
+		}
+	}
+	if len(ifaces) > 0 {
+		return fmt.Sprintf("%s|%s|d", localIP, ifaces[0].Name)
+	}
+	return fmt.Sprintf("%s||e", localIP)
 }

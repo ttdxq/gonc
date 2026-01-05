@@ -41,9 +41,10 @@ type NegotiationConfig struct {
 
 const DefaultKCPIdleTimeoutSecond = 41
 const DefaultUDPIdleTimeoutSecond = 60 * 5
+const DefaultUdpOutputBlockSize = 1320
 
 var (
-	UdpOutputBlockSize   int    = 1320
+	UdpOutputBlockSize   int    = DefaultUdpOutputBlockSize
 	KcpWindowSize        int    = 1500
 	UdpKeepAlivePayload  string = "ping\n"
 	KCPIdleTimeoutSecond int    = DefaultKCPIdleTimeoutSecond
@@ -62,17 +63,19 @@ func NewNegotiationConfig() *NegotiationConfig {
 }
 
 type NegotiatedConn struct {
-	ctx              context.Context
-	cancel           context.CancelFunc
-	Config           *NegotiationConfig
-	KeyingMaterial   [32]byte
-	TopLayer         net.Conn
-	ConnStack        []string
-	ConnLayers       []net.Conn
-	IsUDP            bool
-	IsFramed         bool
-	MQTTHelloPayload string
-	OnClose          func()
+	ctx                  context.Context
+	cancel               context.CancelFunc
+	Config               *NegotiationConfig
+	KeyingMaterial       [32]byte
+	TopLayer             net.Conn
+	ConnStack            []string
+	ConnLayers           []net.Conn
+	IsUDP                bool
+	IsFramed             bool
+	WithKCP              bool
+	MQTTHelloCtrlPayload string
+	MQTTHelloAppPayload  string
+	OnClose              func()
 }
 
 func (nconn *NegotiatedConn) Close() error {
@@ -179,7 +182,6 @@ func DoNegotiation(cfg *NegotiationConfig, rawconn net.Conn, logWriter io.Writer
 		switch cfg.KeyType {
 		case "ECDHE":
 			copy(keyingMaterial[:], []byte(cfg.Key))
-			fmt.Fprintf(logWriter, "%sCommunication is encrypted(ECDHE) with AES.\n", cfg.Label)
 		case "PSK":
 			k, err := DerivePSK(cfg.Key)
 			if err != nil {
@@ -187,17 +189,25 @@ func DoNegotiation(cfg *NegotiationConfig, rawconn net.Conn, logWriter io.Writer
 				return nil, err
 			}
 			copy(keyingMaterial[:], k)
-			fmt.Fprintf(logWriter, "%sCommunication is encrypted(PSK) with AES.\n", cfg.Label)
 		default:
 			fmt.Fprintf(logWriter, "%sMissing key type for secure stream\n", cfg.Label)
 			return nil, fmt.Errorf("missing key type for secure stream")
 		}
+
 		if cfg.SecureLayer == "dss" {
-			connss := NewSecurePacketConn(nconn.ConnLayers[0], keyingMaterial)
+			connss, err := NewSecurePacketConn(nconn.ConnLayers[0], keyingMaterial)
+			if err != nil {
+				return nil, err
+			}
 			nconn.ConnLayers = append([]net.Conn{connss}, nconn.ConnLayers...)
+			fmt.Fprintf(logWriter, "%sCommunication(Datagram) is encrypted(%s) with AES.\n", cfg.Label, cfg.KeyType)
 		} else {
-			connss := NewSecureStreamConn(nconn.ConnLayers[0], keyingMaterial)
+			connss, err := NewSecureStreamConn(nconn.ConnLayers[0], keyingMaterial)
+			if err != nil {
+				return nil, err
+			}
 			nconn.ConnLayers = append([]net.Conn{connss}, nconn.ConnLayers...)
+			fmt.Fprintf(logWriter, "%sCommunication(Stream) is encrypted(%s) with AES.\n", cfg.Label, cfg.KeyType)
 		}
 		connStack = append(connStack, cfg.SecureLayer)
 	default:
@@ -218,6 +228,7 @@ func DoNegotiation(cfg *NegotiationConfig, rawconn net.Conn, logWriter io.Writer
 				copy(keyingMaterial[:], k)
 			}
 			nconn.ConnLayers = append([]net.Conn{sess_kcp}, nconn.ConnLayers...)
+			nconn.WithKCP = true
 			connStack = append(connStack, "kcp")
 		} else {
 			isWrappered := false
@@ -514,7 +525,7 @@ func doKCP(ctx context.Context, config *NegotiationConfig, conn net.Conn, timeou
 		if blockCrypt == nil {
 			fmt.Fprintf(logWriter, "%sPerforming KCP-C handshake...", config.Label)
 		} else {
-			fmt.Fprintf(logWriter, "%sPerforming encrypted(%s) KCP-C handshake using...", config.Label, config.KeyType)
+			fmt.Fprintf(logWriter, "%sPerforming encrypted(%s) KCP-C handshake...", config.Label, config.KeyType)
 		}
 	}
 	sess, err = kcp.NewConn4(0, conn.RemoteAddr(), blockCrypt, 10, 3, true, buconn)
@@ -563,8 +574,8 @@ func doKCP(ctx context.Context, config *NegotiationConfig, conn net.Conn, timeou
 	if strings.Contains(config.SecureLayer, "tls") {
 		mtu -= 60
 	}
-	mtu -= 2 //KCPStreamConn: len header
-	sess.SetMtu(mtu)
+	mtu -= 2         //KCPStreamConn: len header
+	sess.SetMtu(mtu) //如果用户-udp-size设置的值比较大，超过KCP内部限制的1500，会设置失败。
 
 	return netx.NewFramedConn(sess, sess)
 }
@@ -609,7 +620,6 @@ func startUDPKeepAlive(ctx context.Context, conn net.PacketConn, raddr net.Addr,
 				ticker = time.NewTicker(keepAliveInterval)
 			case <-ticker.C:
 				if _, err := conn.WriteTo(data, raddr); err != nil {
-					//fmt.Fprintf(os.Stderr, "keepAlive send failed: %v\n", err)
 					// 不退出，继续重试
 				}
 			}

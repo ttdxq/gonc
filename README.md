@@ -14,6 +14,8 @@ README in [English](./README_en.md) 、 [中文](./README.md)
 
 [最新版本下载](https://www.gonc.cc/)
 
+[详细文档](https://www.gonc.cc/docs/)
+
 ---
 
 ## 使用示例
@@ -141,7 +143,7 @@ README in [English](./README_en.md) 、 [中文](./README.md)
 - 另一端将在本机监听端口3080提供socks5/HTTP代理服务访问远程：
     ```bash
     # link可开启远程代理反向访问，none则表示远程不监听端口
-    gonc -p2p <口令> -link 3080;none
+    gonc -p2p <口令> -link "3080;none"
     ```
 
     使用透明代理特性：接下来例如你想连接远程网络的10.0.0.1:3389，你可以直接在本地远程桌面客户端填要连接的地址为：
@@ -155,7 +157,7 @@ README in [English](./README_en.md) 、 [中文](./README.md)
 - link的配置格式
     ```bash
     # 这表示基于建立的隧道，在本地和远程都监听1080代理端口，支持HTTP或SOCKS5协议互相访问，且端口支持透明代理特性
-    gonc -p2p <口令> -link 1080;1080
+    gonc -p2p <口令> -link "1080;1080"
     
     # 下面是URL格式的配置方式，-link的参数值要引号包起来，否则解析容易出问题
     # 左边 x://0.0.0.0:1080?tproxy=1 和仅写1080等效，右边写法表示远程也要开启1080端口，但没启用透明代理特性

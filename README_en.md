@@ -14,6 +14,8 @@ README in [English](./README_en.md) and [中文](./README.md)
 
 [Latest version download](https://www.gonc.cc/)
 
+[docs](https://www.gonc.cc/docs/)
+
 ---
 
 ## Usage Examples
@@ -133,7 +135,7 @@ On the sender side, start an HTTP file server to expose the files or directories
     ```bash
     # The link option controls how the local and remote proxy endpoints are created.
     # Use none to indicate that no listening port is opened on that side:
-    gonc -p2p passphrase -link 3080;none
+    gonc -p2p passphrase -link "3080;none"
     ```
 
     Next, for example, if you want to connect to 10.0.0.1:3389 in the remote network, you can simply enter the following address in your local Remote Desktop client:
@@ -148,7 +150,7 @@ On the sender side, start an HTTP file server to expose the files or directories
     ```bash
     # Based on the established tunnel, both local and remote sides listen on port 1080.
     # The proxy supports both HTTP and SOCKS5 protocols, with transparent proxy capability enabled.
-    gonc -p2p <passphrase> -link 1080;1080
+    gonc -p2p <passphrase> -link "1080;1080"
 
     # Below is the configuration method for the URL format. The parameter value of -link must be enclosed in quotes; otherwise, parsing problems may occur.
     # The left side x://0.0.0.0:1080?tproxy=1 is equivalent to simply writing 1080.
