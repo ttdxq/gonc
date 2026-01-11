@@ -69,6 +69,7 @@ type P2PAddressInfo struct {
 	RemotePublicIPv4Count int
 	RemotePublicIPv6Count int
 	LocalBindIP           string
+	AllRemoteIPs          []string // 所有可能的远程 IP 地址（包括 STUN 返回的所有地址）
 }
 
 type securePayload struct {
@@ -662,6 +663,18 @@ func Do_autoP2PEx2(ctx context.Context, networks []string, bind, sessionUid stri
 	RemotePublicIPv4Count := countUniquePublicIPs(remotePayload.Addresses, "4")
 	RemotePublicIPv6Count := countUniquePublicIPs(remotePayload.Addresses, "6")
 
+	// 收集所有可能的远程 IP 地址（用于验证连接来源）
+	allRemoteIPs := make(map[string]struct{})
+	for _, addr := range remotePayload.Addresses {
+		// 提取 LAN 和 NAT 地址的 IP 部分
+		if ip := extractIP(addr.Lan); ip != "" {
+			allRemoteIPs[ip] = struct{}{}
+		}
+		if ip := extractIP(addr.Nat); ip != "" {
+			allRemoteIPs[ip] = struct{}{}
+		}
+	}
+
 	for _, myNetInfo := range myInfoForExchange.Addresses {
 		// 获取我们自己的地址组，支持多个地址
 		net := myNetInfo.Network
@@ -679,6 +692,12 @@ func Do_autoP2PEx2(ctx context.Context, networks []string, bind, sessionUid stri
 			remoteLAN := remoteNetInfo.Lan
 			remoteNAT := remoteNetInfo.Nat
 
+			// 构建 AllRemoteIPs 列表
+			var allRemoteIPList []string
+			for ip := range allRemoteIPs {
+				allRemoteIPList = append(allRemoteIPList, ip)
+			}
+
 			item := &P2PAddressInfo{
 				Network:               net,
 				LocalLAN:              myLAN,
@@ -693,6 +712,7 @@ func Do_autoP2PEx2(ctx context.Context, networks []string, bind, sessionUid stri
 				RemotePublicIPv4Count: RemotePublicIPv4Count,
 				RemotePublicIPv6Count: RemotePublicIPv6Count,
 				LocalBindIP:           localBindIP,
+				AllRemoteIPs:          allRemoteIPList,
 			}
 
 			//Priority == 0 means invalid type
@@ -1785,13 +1805,30 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 
 		// Verify the connection is from expected peer
 		clientIP, _, err := net.SplitHostPort(conn.RemoteAddr().String())
-		if err == nil && (clientIP == remoteIP || (sameNAT && similarLAN && IsSameLAN(clientIP, remoteIP))) {
-			tryCommit(conn, "accept")
+		if err == nil {
+			// 检查连接来源是否在预期的远程地址列表中
+			isValidPeer := false
+			if clientIP == remoteIP || (sameNAT && similarLAN && IsSameLAN(clientIP, remoteIP)) {
+				isValidPeer = true
+			} else {
+				// 检查是否在 AllRemoteIPs 列表中
+				for _, validIP := range p2pInfo.AllRemoteIPs {
+					if clientIP == validIP {
+						isValidPeer = true
+						break
+					}
+				}
+			}
+
+			if isValidPeer {
+				tryCommit(conn, "accept")
+			} else {
+				conn.Close()
+				err = fmt.Errorf("unexpected peer connection from %s", clientIP)
+				errChan <- err
+			}
 		} else {
 			conn.Close()
-			if err == nil {
-				err = fmt.Errorf("unexpected peer connection from %s", clientIP)
-			}
 			errChan <- err
 		}
 	}
