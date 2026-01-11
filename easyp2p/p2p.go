@@ -79,6 +79,7 @@ type P2PAddressInfo struct {
 	RemoteNATType            string
 	LANProbeOnly             bool
 	RemoteUDP4NATAlternative []string // 对端的其他UDP4 NAT地址（多出口IP并行打洞用）
+	AllRemoteIPs             []string // 所有可能的远程 IP 地址（包括 STUN 返回的所有地址）
 }
 
 type securePayload struct {
@@ -324,6 +325,22 @@ func buildBaseP2PCandidates(localAddresses, remoteAddresses []PunchingAddressInf
 	lanProbeCandidates []lanProbeCandidate,
 	haveCommonNetwork bool,
 ) {
+	// 收集所有可能的远程 IP 地址（用于验证连接来源）
+	allRemoteIPs := make(map[string]struct{})
+	for _, addr := range remoteAddresses {
+		// 提取 LAN 和 NAT 地址的 IP 部分
+		if ip := extractIP(addr.Lan); ip != "" {
+			allRemoteIPs[ip] = struct{}{}
+		}
+		if ip := extractIP(addr.Nat); ip != "" {
+			allRemoteIPs[ip] = struct{}{}
+		}
+	}
+	var allRemoteIPList []string
+	for ip := range allRemoteIPs {
+		allRemoteIPList = append(allRemoteIPList, ip)
+	}
+
 	for localOrder, myNetInfo := range localAddresses {
 		network := myNetInfo.Network
 		myNATType := myNetInfo.NatType
@@ -347,6 +364,7 @@ func buildBaseP2PCandidates(localAddresses, remoteAddresses []PunchingAddressInf
 				RemoteLAN:     remoteLAN,
 				RemoteNAT:     remoteNAT,
 				RemoteNATType: remoteNATType,
+				AllRemoteIPs:  allRemoteIPList,
 			}
 
 			if getNATTypePriority(myNATType) == 0 || getNATTypePriority(remoteNATType) == 0 {
@@ -2149,6 +2167,11 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 						(sameNAT && remoteLANIP != "" && peerIP == remoteLANIP) ||
 						(lanProbeEnabled && (peerIP == remoteLANIP || IsSameLAN(peerIP, localAddr.IP.String()))) {
 						return nil
+					}
+					for _, validIP := range p2pInfo.AllRemoteIPs {
+						if peerIP == validIP {
+							return nil
+						}
 					}
 					return fmt.Errorf("unexpected peer connection from %s", peerIP)
 				},
