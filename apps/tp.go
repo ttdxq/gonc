@@ -21,6 +21,7 @@ type AppTPConfig struct {
 	Logger      *log.Logger
 	proxyConfig *ProxyClientConfig
 	dialer      *ProxyClient
+	allow       string
 }
 
 func AppTPConfigByArgs(logWriter io.Writer, args []string) (*AppTPConfig, error) {
@@ -37,6 +38,7 @@ func AppTPConfigByArgs(logWriter io.Writer, args []string) (*AppTPConfig, error)
 	fs.StringVar(&protocol, "X", "", "proxy_protocol. Supported protocols are “5” (SOCKS v.5) and “connect” (HTTPS proxy).  If the protocol is not specified, SOCKS version 5 is used.")
 	fs.StringVar(&proxyAddr, "x", "", "\"ip:port\" for proxy_address")
 	fs.StringVar(&authString, "auth", "", "user:password for proxy")
+	fs.StringVar(&config.allow, "allow", "private", "private|domain")
 
 	// 设置自定义的 Usage 函数
 	fs.Usage = func() {
@@ -47,6 +49,12 @@ func AppTPConfigByArgs(logWriter io.Writer, args []string) (*AppTPConfig, error)
 	err := fs.Parse(args)
 	if err != nil {
 		return nil, err // 解析错误直接返回
+	}
+
+	switch config.allow {
+	case "private", "domain", "any":
+	default:
+		return nil, fmt.Errorf("invalid allow option: %s", config.allow)
 	}
 
 	if proxyAddr == "" {
@@ -93,7 +101,12 @@ func App_tp_main_withconfig(conn net.Conn, config *AppTPConfig) {
 	if magicTarget == "127.0.0.1" {
 		return
 	}
-	targetHost, targetPort, err := DNSLookupMagicIP(magicTarget, true)
+	allowPublicIP := false
+	if config.allow == "domain" || config.allow == "any" {
+		allowPublicIP = true
+	}
+
+	targetHost, targetPort, err := DNSLookupMagicIP(magicTarget, allowPublicIP)
 	if err != nil {
 		config.Logger.Println("DNSLookupMagicIP failed:", err)
 		return
@@ -110,22 +123,24 @@ func App_tp_main_withconfig(conn net.Conn, config *AppTPConfig) {
 	bidirectionalCopy(conn, targetConn)
 }
 
-func IsValidABC0IP(ipStr string) bool {
+func IsValidABC0IP(ipStr string) (bool, string) {
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
-		return false
+		return false, ""
 	}
 
 	ip = ip.To4()
 	if ip == nil {
-		return false
+		return false, ""
 	}
 
-	// 检查最后一个字节是否为 0
+	// Check if the last octet is 0
 	if ip[3] != 0 {
-		return false
+		return false, ""
 	}
-	return true
+
+	abc := fmt.Sprintf("%d.%d.%d", ip[0], ip[1], ip[2])
+	return true, abc
 }
 
 func ExtractBCDFrom127(ipStr string) (b int, cd int, err error) {
@@ -159,9 +174,8 @@ func DNSLookupMagicIP(ipToken string, allowPublicIP bool) (string, int, error) {
 	}
 	b := parsed.To4()
 
-	donotUsePublicMagicDNS := IsValidABC0IP(MagicDNServer)
+	donotUsePublicMagicDNS, targetIpPref := IsValidABC0IP(MagicDNServer)
 	if donotUsePublicMagicDNS {
-		targetIpPref := strings.TrimRight(MagicDNServer, ".0")
 		targetIpD, targetPort, err := ExtractBCDFrom127(ipToken)
 		if err != nil {
 			return "", 0, fmt.Errorf("invalid ipToken: %v", err)

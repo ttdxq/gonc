@@ -1,10 +1,10 @@
 # 欢迎使用 gonc
 
-[![Go Report Card](https://goreportcard.com/badge/github.com/threatexpert/gonc)](https://goreportcard.com/report/github.com/threatexpert/gonc)
+[![Go Report Card](https://goreportcard.com/badge/github.com/threatexpert/gonc/v2)](https://goreportcard.com/report/github.com/threatexpert/gonc/v2)
 [![GitHub license](https://img.shields.io/github/license/threatexpert/gonc)](https://github.com/threatexpert/gonc/blob/master/LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/threatexpert/gonc)](https://github.com/threatexpert/gonc/stargazers)
 
-**gonc** 是一个现代化的、功能增强版的网络瑞士军刀。它保留了经典 `netcat` 的简洁管道设计，并针对现代复杂的网络环境（NAT、防火墙）引入了 **P2P 穿透**、**多路复用**、**强加密** 以及 **内置服务模块**。
+**gonc** 是一个现代化的、功能增强版的网络瑞士军刀。它保留了经典 `netcat` 的简洁管道设计，并针对现代复杂的网络环境（NAT、防火墙）引入了 **P2P 穿透**、**多路复用**、**强加密** 以及 **内置服务模块**，并且**完全开源（100% Open Source）**。
 
 如果你习惯使用 `nc`，那么 `gonc` 将给你带来“鸟枪换炮”的体验。
 
@@ -35,6 +35,8 @@
 ---
 
 ## 🚀 快速安装
+
+访问 [https://www.gonc.cc/](https://www.gonc.cc/) 或者 [GitHub Releases](https://github.com/threatexpert/gonc/releases) 选择相应系统/CPU架构。
 
 === "Go Install (推荐)"
 
@@ -75,16 +77,13 @@
 ### 1. 经典用法：像 Netcat 一样点对点聊天
 除了兼容 `nc` 常用的监听和主动连接的模式，现在还可以这样：
 
-```bash
-gonc -p2p 口令
-```
+`gonc -p2p 口令`
+
+例如：主机A和主机B执行下面相同的命令，注意等待另一端超过25秒将超时
 
 ```bash
-# 主机A执行命令，开始等待另一端，注意25秒将超时
 gonc -p2p mysecret123
 
-# 主机B将自动和主机A建立连接
-gonc -p2p mysecret123
 ```
 
 两端用同样的口令，然后双方就能基于口令发现彼此的网络地址，穿透 NAT ，双向认证和加密通讯。 默认优先 tcp 尝试直连，不行再试 udp ，一旦连接建立成功，和传统 nc 一样你可以利用管道重定向实现自己的数据传输。

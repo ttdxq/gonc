@@ -8,34 +8,37 @@
     ```bash
     gonc -e ":<command> [args]" ...
     ```
-    注意：内置命令始终以冒号 `:` 开头。要查看特定模块的帮助，可运行 `gonc -e ":<cmd> -h"`，例如 `gonc -e ":s5s -h"`。
+    注意：
+    
+    * **查看子模块参数**：内置命令始终以冒号 `:` 开头。要查看特定模块的帮助，可运行 `gonc -e ":<cmd> -h"`，例如 `gonc -e ":s5s -h"`。
+    * **字符\\**：args中`\`需要`\\`转义表示。例如 gonc -e ":httpserver d:\\\\dir"，建议windows下路径也用/字符。
 
 ---
 
-## 🐚 `:sh` - 远程 Shell
+## 🐚 `:sh` - 远程 Shell {: #shell }
 
 提供交互式的命令行访问。这是最常用的模块。
 
 **原理**：
-将网络连接的标准输入/输出 (Stdin/Stdout) 绑定到系统的 Shell 进程，不支持Windows，Linux/Mac 为 `/bin/sh` 或 `/bin/bash`。
+将网络连接的标准输入/输出 (Stdin/Stdout) 绑定到系统的 Shell 进程。
 
 **参数**：
 * `[path]`: (可选) 指定 Shell 的路径。
 
 **示例**：
 
-=== "Linux / macOS"
+=== "Windows / Linux / macOS"
     ```bash
-    # 默认调用 /bin/sh
+    # 调用系统默认的 shell
     gonc -e ":sh" -l 1234 
     
     # 指定 bash
     gonc -e ":sh /bin/bash" -l 1234 
     ```
 
-=== "Windows"
+=== "旧版Windows"
     ```bash
-    # :sh不支持windows，-e可以直接执行cmd，但客户端不支持用-pty的方式
+    # :sh不支持旧版windows（早于win10 1809），-e可以直接执行cmd，但客户端不支持用-pty的方式
     gonc -l 1234 -e "cmd"
     ```
 
@@ -47,7 +50,7 @@
 
 ---
 
-## 🌐 `:s5s` - SOCKS5 代理服务
+## 🌐 `:s5s` - SOCKS5 代理服务 {: #socks5 }
 
 将当前连接转换为一个标准的 SOCKS5 代理服务器。
 
@@ -62,7 +65,7 @@
 
 * `-c`: 是CONNECT方法，默认启用，可以-c=0关闭。
 
-* `-b`: 是BIND方法，默认不开启。
+* `-b`: 是BIND方法，默认不开启。BIND功能是经过优化的，可实现frp的反向代理功能。而传统socks5的BIND则不行。
 
 * `-http`: 开启兼容HTTP代理协议，这样同时能支持HTTP代理的客户端了。
 
@@ -79,7 +82,10 @@ gonc -k -e ":s5s -auth user:simplekey123" -l 1080
 
 **高级组合 (Socks5 over TLS)**：
 利用 `gonc` 的加密通道保护 SOCKS5 流量。
-
+<div class="interactive-box">
+  <label>🛠️设置示例server-ip:</label>
+  <input type="text" placeholder="server-ip" value="server-ip" oninput="updateServerIP(this)">
+</div>
 === "SOCKS5服务器（加密）"
 
 ```bash
@@ -94,7 +100,7 @@ gonc -tls -psk simplekey123 -e ":s5s -b" -k -l 8443
 
     ```bash
     # 客户端调用:nc建立加密TCP连接。不支持代理UDP
-    gonc -e ":nc -tls -psk simplekey123 <serverIP> 8443" -k -l 127.0.0.1 1080
+    gonc -e ":nc -tls -psk simplekey123 server-ip 8443" -k -l 127.0.0.1 1080
 
     ```
 
@@ -102,13 +108,13 @@ gonc -tls -psk simplekey123 -e ":s5s -b" -k -l 8443
 
     ```bash
     # 实现类似frp反向代理，请求代理服务器保持开启23306端口，并转发到本机127.0.0.1 3306
-    gonc -x "-tls -psk simplekey123 <serverIP>:8443" -e ":nc 127.0.0.1 3306" -k -l 23306
+    gonc -x "-tls -psk simplekey123 server-ip:8443" -e ":nc 127.0.0.1 3306" -k -l 23306
 
     ```
 
 ---
 
-## 🔀 `:tp` - 透明代理
+## 🔀 `:tp` - 透明代理 {: #tproxy }
 
 :tp 是一种透明端口转发机制，用于在客户端不支持或不便配置代理的场景下，通过本地监听端口自动完成代理转发。
 
@@ -134,23 +140,34 @@ gonc -tls -psk simplekey123 -e ":s5s -b" -k -l 8443
 
 以 远程桌面客户端（RDP） 为例，用户在客户端中填入地址：
 
-`10.0.0.5-3389.gonc.cc:3080`
+`10.0.0.1-3389.gonc.cc:3080`
 
 连接过程如下：
 
-- 客户端解析 10.0.0.5-3389.gonc.cc，得到形如 127.a.b.c 的回环地址
+- 客户端解析 10.0.0.1-3389.gonc.cc，得到形如 127.b.c.d 的回环地址
 
 - 客户端认为自己在直连目标服务，并实际连接到本机的 3080 端口
 
-- :tp 用127.a.b.c反查域名，解析出真实目标 10.0.0.5:3389
+- :tp 用127.b.c.d反查域名，解析出真实目标 10.0.0.1:3389
 
 - :tp 自动通过配置好的上游代理（如 127.0.0.1:1080）发起代理连接
 
 - 客户端与远端服务之间的通信在整个过程中无需任何代理配置
 
+!!! warning "隐私和安全问题"
+
+    这个特性依赖ns.gonc.cc公网DNS解析，出于对用户隐私和安全保护，gonc的透明代理默认只接受内网私有IP段，不接受公网IP或域名方式，例如tonypc.corp.lan-3389.gonc.cc。除非用户明确的使用参数":tp -x 127.0.0.1:1080 **-allow domain**"
+
+    需要说明的是，`ns.gonc.cc` 服务器只能看到 `*.gonc.cc` 的 DNS 解析请求记录，通常无法获知具体客户端的真实 IP 地址。这是因为（DNS递归查询机制）客户端的请求一般会先经过ISP的DNS或公共 DNS 运营商（如 8.8.8.8），再由其转发至 ns.gonc.cc。
+
+    关于安全问题，例如在处理`mstsc`连接时，如果 DNS 被恶意篡改，理论上可能得到`1.2.3.4-3389`这样的地址，而不是预期的`10.0.0.1-3389`。
+    由于`gonc`默认只允许内网 IP 段，这类异常连接会被拒绝，保证透明代理不会将客户端流量发送到你对端内网之外的目的地。
+
+    因此，在默认配置下，该机制通常不会带来额外的隐私或安全风险。
+
 ---
 
-## 🔗 `:nc` - 端口转发 (Netcat)
+## 🔗 `:nc` - 端口转发 (Netcat) {: #nc }
 
 :nc安全等效于gonc本身，即gonc可以在内存中执行自己，不用开启子进程，因此可以实现高效的将流量转发到另一个地址。
 
@@ -180,7 +197,7 @@ gonc -e ":nc -framed -u 8.8.8.8 53" -framed -udp-timeout 2 -u -k -l 53
 
 ---
 
-## 📂 `:httpserver` - 文件服务器
+## 📂 `:httpserver` - 文件服务器 {: #httpserver }
 
 快速共享文件或目录。
 
@@ -204,9 +221,9 @@ gonc -e ":httpserver /var/www/html /tmp/test" -k -l 8080
 
 ---
 
-## 🧬 `:mux` - 多路复用的文件服务和代理服务
+## 🧬 `:mux` - 多路复用的代理服务和文件服务 {: #mux }
 
-`:mux` 主要用于建立隧道，它可用在单个TCP/KCP会话上创建多个虚拟流，为本地接入的客户端提供并发访问的体验。目前基于mux集成了两个应用功能：HTTP文件服务和SOCKS5/HTTP代理服务。通过传统方式建立的连接或P2P建立的连接都可以使用mux来提供文件服务和代理服务。
+`:mux` 目前集成了两个应用功能：HTTP文件服务和SOCKS5/HTTP代理服务。是`gonc`为了在P2P场景提供用户更容易上手的文件传输和内网穿透功能，比起你用:s5s或:httpserver要更容易上手。
 
 **核心引擎**：
 可以通过 `-mux-engine` 参数切换底层引擎： `smux` (默认)。`yamux`另一个流行mux引擎。
@@ -217,9 +234,9 @@ gonc -e ":httpserver /var/www/html /tmp/test" -k -l 8080
 
 ```
 
-### 1. 隧道构建 (`link` / `linkagent`)
+### 1. 代理服务隧道构建 (`link` / `linkagent`)  {: #link }
 
-这是构建复杂端口映射和内网穿透的核心功能。
+这是构建复杂端口映射和内网穿透的核心功能。link还特意处理了SOCKS5的UDP代理，实现UDP走MUX隧道从对端出去。这解决了使用`:s5s`加`-mux`无法代理UDP的问题。
 
 * **`:mux linkagent`**: 启动双向代理 Agent，通常在**服务端**（等待连接的一方）使用。
 * **`:mux link "<L-Config>;<R-Config>"`**: 定义隧道规则，通常在**客户端**（发起连接的一方）使用。
@@ -338,7 +355,7 @@ gonc -p2p mysecret123 -link "x+tls://0.0.0.0:8443?cert=ca.pem&key=key.pem;none"
 ```
 
 
-### 2. 文件传输 (`httpserver` / `httpclient`)
+### 2. 文件传输 (`httpserver` / `httpclient`) {: #file }
 
 在复用通道中直接传输文件，无需建立额外的连接，支持断点续传。
 
@@ -381,7 +398,7 @@ gonc -p2p mysecret123 -link "x+tls://0.0.0.0:8443?cert=ca.pem&key=key.pem;none"
     gonc -p2p mysecret123 -httplocal-port 8080
     ```
 
-### 3. 监听模式 (`-l`)
+### 3. 监听模式 (`-l`) {: #muxlisten }
 
 **语法**：
 
@@ -393,7 +410,7 @@ gonc -p2p mysecret123 -k -mqtt-wait -e ":mux -l <port>"
 指定 `:mux` 模块在特定的本地端口上监听，对端httpserver时，指定本地监听 <port> 作为mux的入口，共浏览器或gonc访问对端的HTTP服务。
 
 
-### 4. `socks5`
+### 4. `socks5` {: #muxsocks5 }
 
 类似linkagent，不展开介绍，新版的linkagent功能已经取代它。
 
@@ -404,7 +421,7 @@ gonc -p2p mysecret123 -k -mqtt-wait -e ":mux socks5"
 
 ---
 
-## 🤖 `:service` - 动态服务 (Super Server)
+## 🤖 `:service` - 动态服务 (Super Server) {: #service }
 
 它允许在一个监听端口上，根据客户端的请求（Call）动态提供不同的服务。类似于 Linux 的 `inetd` 或 SSH 的多功能端口。
 
@@ -416,10 +433,10 @@ gonc -p2p mysecret123 -k -mqtt-wait -e ":mux socks5"
 
 ### 服务端配置示例
 
-启动一个端口 `2222`，同时提供 Shell、SOCKS5 和 HTTP 服务，并使用 TLS+PSK 加密：
+启动一个端口 `2222`，开启mux模式，同时提供 Shell、SOCKS5 和 HTTP 服务，并使用 TLS+PSK 加密：
 
 ```bash
-gonc -l -local :2222 -tls -psk mysecret123 -keep-open \
+gonc -l 2222 -tls -psk mysecret123 -keep-open -mux \
     -e ":service" \
     -:sh "/bin/bash"  \
     -:s5s "-http" \
@@ -429,21 +446,27 @@ gonc -l -local :2222 -tls -psk mysecret123 -keep-open \
 
 ### 客户端调用示例
 
+<div class="interactive-box">
+  <label>🛠️设置示例server-ip:</label>
+  <input type="text" placeholder="server-ip" value="server-ip" oninput="updateServerIP(this)">
+</div>
+
 === "调用 Shell"
+    shell模式，`-mux-l`用`-`表示不用本地再监听端口，直接用stdio接入
     ```bash
-    gonc -remote <server-ip>:2222 -tls -psk mysecret123 -call :sh -pty
+    gonc server-ip 2222 -tls -psk mysecret123 -call :sh -pty -mux-l -
     ```
 
 === "调用 SOCKS5"
-    在本地启动 1080 端口，通过 server 的 :s5s 模块代理上网。
+    在本地启动 1080 端口，通过 server 的 `:s5s` 模块代理上网。
     ```bash
-    gonc -e ":nc -tls -psk mysecret123 -call :s5s <server-ip> 2222" -k -l 127.0.0.1 1080 
+    gonc server-ip 2222 -tls -psk mysecret123 -call :s5s -mux-l 1080 
     ```
 
 === "调用 HTTP"
-    将服务端的 /tmp 映射到本地 8000 端口
+    将服务端的 /tmp 映射到本地 8080 端口
     ```bash
-    gonc -e ":nc -tls -psk mysecret123 -call :httpserver <server-ip> 2222" -k -l 127.0.0.1 8080 
+    gonc server-ip 2222 -tls -psk mysecret123 -call :httpserver -mux-l 8080 
     ```
 
 ### 为什么使用 `:service`？

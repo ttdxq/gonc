@@ -461,9 +461,8 @@ func setupLinkRuntimeConfig(muxcfg *MuxSessionConfig, scheme string, params url.
 
 		muxcfg.Logger.Printf("[link-x] Listening on %s (TProxy=%v)\n", ln.Addr().String(), cfg.UseTProxy)
 		if cfg.UseTProxy {
-			donotUsePublicMagicDNS := IsValidABC0IP(MagicDNServer)
+			donotUsePublicMagicDNS, targetIpPref := IsValidABC0IP(MagicDNServer)
 			if donotUsePublicMagicDNS {
-				targetIpPref := strings.TrimRight(MagicDNServer, ".0")
 				muxcfg.Logger.Printf("   TProxy Format: 127.1.13.61:%s -> %s.1:3389\n", actualListenPort, targetIpPref)
 			} else {
 				muxcfg.Logger.Printf("   TProxy Format: 10.0.0.1-3389.%s:%s -> 10.0.0.1:3389\n", MagicDNServer, actualListenPort)
@@ -744,7 +743,7 @@ func handleListenMode(cfg *MuxSessionConfig, notifyAddrChan chan<- string, done 
 		close(sessionDone)
 	}()
 
-	scheme := "raw"
+	var scheme string
 	params := make(url.Values)
 	useTProxy := false
 
@@ -806,7 +805,7 @@ func handleLinkAgentMode(cfg *MuxSessionConfig) error {
 
 	var ln net.Listener
 	var rtConfig *linkRuntimeConfig
-	ackMsg := "OK"
+	var ackMsg string
 
 	if rScheme != "none" {
 		// -------------------------------------------------------------

@@ -34,7 +34,7 @@ import (
 )
 
 var (
-	VERSION = "v2.4.7"
+	VERSION = "v2.4.9"
 )
 
 type AppNetcatConfig struct {
@@ -142,7 +142,9 @@ type AppNetcatConfig struct {
 	verboseWithTime   bool
 	muxEnabled        bool
 	muxLocalPort      string
-	muxListener       net.Listener
+	muxLocalListener  net.Listener
+	dialreadTimeout   int
+	scanOnly          bool
 }
 
 // AppNetcatConfigByArgs 解析给定的 []string 参数，生成 AppNetcatConfig
@@ -206,7 +208,9 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	fs.StringVar(&config.p2pReportURL, "p2p-report-url", "", "API for reporting P2P status")
 	fs.BoolVar(&config.useMutilPath, "mp", false, "enable multipath(NOT IMPL)")
 	fs.BoolVar(&config.useMQTTWait, "mqtt-wait", false, "wait for MQTT hello message before initiating P2P connection")
+	fs.BoolVar(&config.useMQTTWait, "W", false, "alias for -mqtt-wait")
 	fs.BoolVar(&config.useMQTTHello, "mqtt-hello", false, "send MQTT hello message before initiating P2P connection")
+	fs.BoolVar(&config.useMQTTHello, "H", false, "alias for -mqtt-hello")
 	fs.BoolVar(&config.useIPv4, "4", false, "Forces to use IPv4 addresses only")
 	fs.BoolVar(&config.useIPv6, "6", false, "Forces to use IPv4 addresses only")
 	fs.StringVar(&config.useDNS, "dns", "", "set DNS Server")
@@ -227,8 +231,10 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	fs.BoolVar(&config.tlsVerifyCert, "verify", false, "verify TLS certificate (client mode only)")
 	fs.IntVar(&config.keepAlive, "keepalive", 0, "none 0 will enable keepalive feature")
 	fs.BoolVar(&config.verbose, "v", true, "verbose output")
-	fs.BoolVar(&config.muxEnabled, "mux", false, "Enable multiplexing protocol")
-	fs.StringVar(&config.muxLocalPort, "mux-l", "", "Enable multiplexing protocol. Open a local listener")
+	fs.BoolVar(&config.muxEnabled, "mux", false, "Enable multiplexing protocol. Server mux mode")
+	fs.StringVar(&config.muxLocalPort, "mux-l", "", "Client mux mode: local listen port or '-' for stdin/stdout")
+	fs.IntVar(&config.dialreadTimeout, "w", 0, "timeout in seconds for dialing or idle reads (0 = disabled)")
+	fs.BoolVar(&config.scanOnly, "z", false, "connection test mode (establish connection only, no data transfer")
 
 	fs.StringVar(&config.runCmd, "e", "", "alias for -exec")
 	fs.BoolVar(&config.progressEnabled, "P", false, "alias for -progress")
@@ -258,6 +264,7 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	fs.IntVar(&secure.UdpOutputBlockSize, "udp-size", secure.UdpOutputBlockSize, "")
 	fs.IntVar(&secure.KcpWindowSize, "kcp-window-size", secure.KcpWindowSize, "")
 	fs.IntVar(&secure.KCPIdleTimeoutSecond, "kcp-timeout", secure.KCPIdleTimeoutSecond, "kcp idle timeout seconds (0 means no timeout)")
+	fs.IntVar(&secure.KcpUpdateInterval, "kcp-update-interval", secure.KcpUpdateInterval, "KCP update interval in milliseconds")
 	fs.StringVar(&secure.UdpKeepAlivePayload, "udp-ping-data", secure.UdpKeepAlivePayload, "")
 	fs.IntVar(&secure.UDPIdleTimeoutSecond, "udp-timeout", secure.UDPIdleTimeoutSecond, "udp idle timeout seconds (0 means no timeout)")
 	fs.StringVar(&VarmuxEngine, "mux-engine", VarmuxEngine, "yamux | smux")
@@ -440,13 +447,13 @@ func App_Netcat_main_withconfig(console net.Conn, config *AppNetcatConfig) int {
 		return runFeatureModules(console, config)
 	}
 
-	if config.muxLocalPort != "" {
+	if isLocalMuxMode(config) && config.muxLocalListener == nil && config.muxLocalPort != "-" {
 		ln, err := prepareLocalListener(config.muxLocalPort, false)
 		if err != nil {
 			config.Logger.Printf("Error starting local mux listener on %s: %v\n", config.muxLocalPort, err)
 			return 1
 		}
-		config.muxListener = ln
+		config.muxLocalListener = ln
 		config.Logger.Printf("Mux local listener started on %s\n", ln.Addr().String())
 	}
 
@@ -456,6 +463,12 @@ func App_Netcat_main_withconfig(console net.Conn, config *AppNetcatConfig) int {
 		if config.listenMode {
 			return runListenMode(console, config, config.network, config.host, config.port)
 		} else {
+			startPort, endPort, isRange := parsePortRange(config.port)
+			if isRange {
+				// 进入并发扫描模式
+				concurrency := 50
+				return runScanMode(console, config, startPort, endPort, concurrency)
+			}
 			return runDialMode(console, config, config.network, config.host, config.port)
 		}
 	}
@@ -482,6 +495,14 @@ func firstInit(ncconfig *AppNetcatConfig) {
 	}
 }
 
+func isEnabledMuxMode(ncconfig *AppNetcatConfig) bool {
+	return ncconfig.muxEnabled || ncconfig.muxLocalPort != ""
+}
+
+func isLocalMuxMode(ncconfig *AppNetcatConfig) bool {
+	return isEnabledMuxMode(ncconfig) && ncconfig.muxLocalPort != ""
+}
+
 func isAppModeRequiredKeepOpen(ncconfig *AppNetcatConfig) bool {
 	if ncconfig.runAppFileServ != "" ||
 		ncconfig.runAppFileGet != "" ||
@@ -497,6 +518,8 @@ func isAppModeRequiredKeepOpen(ncconfig *AppNetcatConfig) bool {
 
 // configureAppMode 为内置应用程序设置命令参数
 func configureAppMode(ncconfig *AppNetcatConfig) {
+	userSpecifiedRunCmd := ncconfig.runCmd != ""
+	appMode := false
 	if ncconfig.runAppFileServ != "" {
 		//使用了-httpserver 的情况，获取多余的参数都当作根目录添加进去。
 		rootPaths := []string{ncconfig.runAppFileServ}
@@ -517,6 +540,7 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 		ncconfig.useMQTTWait = true
 		ncconfig.progressEnabled = true
 		ncconfig.keepOpen = true
+		appMode = true
 	} else if ncconfig.runAppFileGet != "" {
 		escapedPath := strings.ReplaceAll(ncconfig.runAppFileGet, "\\", "/")
 		downloadSubPath := strings.ReplaceAll(ncconfig.downloadSubPath, "\\", "/")
@@ -529,20 +553,24 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 		}
 		ncconfig.useMQTTHello = true
 		ncconfig.keepOpen = true
+		appMode = true
 	} else if ncconfig.appMuxSocksMode {
 		ncconfig.runCmd = ":mux socks5"
 		ncconfig.useMQTTWait = true
 		ncconfig.progressEnabled = true
 		ncconfig.keepOpen = true
+		appMode = true
 	} else if ncconfig.appMuxLinkAgent {
 		ncconfig.runCmd = ":mux linkagent"
 		ncconfig.useMQTTWait = true
 		ncconfig.progressEnabled = true
 		ncconfig.keepOpen = true
+		appMode = true
 	} else if ncconfig.runAppLink != "" {
 		ncconfig.runCmd = ":mux link " + ncconfig.runAppLink
 		ncconfig.useMQTTHello = true
 		ncconfig.keepOpen = true
+		appMode = true
 	} else if ncconfig.appMuxListenMode || ncconfig.appMuxListenOn != "" {
 		if ncconfig.appMuxListenOn == "" {
 			ncconfig.appMuxListenOn = "0"
@@ -550,6 +578,13 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 		ncconfig.runCmd = fmt.Sprintf(":mux -l %s", ncconfig.appMuxListenOn)
 		ncconfig.useMQTTHello = true
 		ncconfig.keepOpen = true
+		appMode = true
+	}
+
+	if appMode && userSpecifiedRunCmd {
+		// appMode（-linkagent等） 需要替换runCmd， 如果本来用户配置了-e，则有冲突
+		ncconfig.Logger.Printf("Error: App modes (-httpserver, -linkagent, etc.) cannot be used with -e \n")
+		os.Exit(1)
 	}
 
 	if ncconfig.portRotate {
@@ -751,7 +786,7 @@ func determineNetworkAndAddress(ncconfig *AppNetcatConfig) (network, host, port,
 				} else {
 					ncconfig.MQTTHelloPayload.SetControlValue("cs", "tls")
 				}
-				if ncconfig.muxLocalPort != "" {
+				if isLocalMuxMode(ncconfig) {
 					ncconfig.MQTTHelloPayload.SetControlValue("mux", "1")
 				}
 			}
@@ -1023,6 +1058,7 @@ func startTCPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 			if err != nil {
 				ncconfig.Logger.Printf("Error accepting connection: %v\n", err)
 				if socks5BindMode {
+					listener.Close()
 					listener, err = retrySocks5Bind(ncconfig, proxyClient, network, listenAddr)
 					if err != nil {
 						return 1
@@ -1054,7 +1090,9 @@ func startTCPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 				}(conn)
 			}
 			if socks5BindMode {
-				listener.Close()
+				if listener != nil {
+					listener.Close()
+				}
 				listener, err = retrySocks5Bind(ncconfig, proxyClient, network, listenAddr)
 				if err != nil {
 					return 1
@@ -1081,6 +1119,54 @@ func startTCPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 		}
 		return handleSingleConnection(console, ncconfig, conn)
 	}
+}
+
+// parsePortRange 解析端口字符串。
+// 返回值: (起始端口, 结束端口, 是否是范围格式)
+func parsePortRange(portStr string) (int, int, bool) {
+	if !strings.Contains(portStr, "-") {
+		return 0, 0, false
+	}
+
+	parts := strings.Split(portStr, "-")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+
+	start, err1 := strconv.Atoi(parts[0])
+	end, err2 := strconv.Atoi(parts[1])
+
+	// 简单的校验：必须是数字，且 start <= end
+	if err1 != nil || err2 != nil || start > end {
+		return 0, 0, false
+	}
+
+	return start, end, true
+}
+
+func runScanMode(console net.Conn, ncconfig *AppNetcatConfig, start, end, limit int) int {
+	var wg sync.WaitGroup
+	// 使用带缓冲的 channel 作为信号量，控制最大并发数
+	sem := make(chan struct{}, limit)
+
+	for port := start; port <= end; port++ {
+		// 1. 获取令牌：如果信道满了，这里会阻塞，直到有协程释放
+		sem <- struct{}{}
+		wg.Add(1)
+
+		go func(p int) {
+			defer wg.Done()
+			defer func() { <-sem }() // 3. 释放令牌
+
+			// 将 int 转为 string
+			portStr := strconv.Itoa(p)
+
+			runDialMode(console, ncconfig, ncconfig.network, ncconfig.host, portStr)
+		}(port)
+	}
+
+	wg.Wait()
+	return 0
 }
 
 // runDialMode 在主动连接模式下启动客户端
@@ -1123,7 +1209,11 @@ func runDialMode(console net.Conn, ncconfig *AppNetcatConfig, network, host, por
 		}
 
 		if localAddr == nil {
-			conn, err = proxyClient.DialTimeout(network, net.JoinHostPort(host, port), 20*time.Second)
+			dialTimeout := 20 * time.Second
+			if ncconfig.dialreadTimeout != 0 {
+				dialTimeout = time.Duration(ncconfig.dialreadTimeout) * time.Second
+			}
+			conn, err = proxyClient.DialTimeout(network, net.JoinHostPort(host, port), dialTimeout)
 		} else {
 			dialer := &net.Dialer{LocalAddr: localAddr}
 			switch {
@@ -1131,6 +1221,9 @@ func runDialMode(console net.Conn, ncconfig *AppNetcatConfig, network, host, por
 				dialer.Control = netx.ControlTCP
 			case strings.HasPrefix(network, "udp"):
 				dialer.Control = netx.ControlUDP
+			}
+			if ncconfig.dialreadTimeout != 0 {
+				dialer.Timeout = time.Duration(ncconfig.dialreadTimeout) * time.Second
 			}
 			conn, err = dialer.Dial(network, net.JoinHostPort(host, port))
 		}
@@ -1174,6 +1267,7 @@ func runDialMode(console net.Conn, ncconfig *AppNetcatConfig, network, host, por
 	if ncconfig.verboseWithTime {
 		defer ncconfig.Logger.Printf("%s\n", offTip)
 	}
+
 	return handleSingleConnection(console, ncconfig, conn)
 }
 
@@ -1728,6 +1822,10 @@ func conflictCheck(ncconfig *AppNetcatConfig) int {
 		ncconfig.Logger.Printf("-ss and (-plain -tls) cannot be used together\n")
 		return 1
 	}
+	if isEnabledMuxMode(ncconfig) && ncconfig.app_mux_args != "-" {
+		ncconfig.Logger.Printf("mux mode and -e \":mux\" cannot be used together\n")
+		return 1
+	}
 	return 0
 }
 
@@ -1745,6 +1843,9 @@ func preinitBuiltinAppConfig(ncconfig *AppNetcatConfig, commandline string) erro
 	builtinApp := args[0]
 	switch builtinApp {
 	case ":mux":
+		if isEnabledMuxMode(ncconfig) {
+			return fmt.Errorf("mux mode and -e \":mux\" cannot be used together")
+		}
 		ncconfig.app_mux_Config, err = AppMuxConfigByArgs(ncconfig.LogWriter, args[1:])
 		if err != nil {
 			usage = App_mux_usage
@@ -1790,7 +1891,7 @@ func preinitBuiltinAppConfig(ncconfig *AppNetcatConfig, commandline string) erro
 }
 
 // 用于在数据传输时显示进度
-func copyWithProgress(ncconfig *AppNetcatConfig, dst io.Writer, src io.Reader, blocksize int, bufferedReader bool, stats *misc.ProgressStats, maxBytes int64) error {
+func copyWithProgress(ncconfig *AppNetcatConfig, dst io.Writer, src io.Reader, blocksize int, bufferedReader bool, stats *misc.ProgressStats, maxBytes int64, readIdleTimeout int) error {
 	bufsize := blocksize
 	if bufsize < 32*1024 {
 		bufsize = 32 * 1024 // reader 缓冲区更大，提高吞吐
@@ -1807,9 +1908,23 @@ func copyWithProgress(ncconfig *AppNetcatConfig, dst io.Writer, src io.Reader, b
 	var totalWritten int64
 
 	for {
+		rtimeout := false
+		if readIdleTimeout > 0 {
+			type readDeadliner interface {
+				SetReadDeadline(t time.Time) error
+			}
+			if rd, ok := src.(readDeadliner); ok {
+				err = rd.SetReadDeadline(time.Now().Add(time.Duration(readIdleTimeout) * time.Second))
+				if err == nil {
+					rtimeout = true
+				}
+			}
+		}
 		n, err1 = reader.Read(buf)
 		if err1 != nil && err1 != io.EOF {
-			//ncconfig.Logger.Printf("Read error: %v\n", err1)
+			if rtimeout && os.IsTimeout(err1) {
+				ncconfig.Logger.Printf("Read error: %v\n", err1)
+			}
 			break
 		}
 		if n == 0 {
@@ -1896,6 +2011,7 @@ func preinitNegotiationConfig(ncconfig *AppNetcatConfig) *secure.NegotiationConf
 	genCertForced := ncconfig.presharedKey != ""
 	config.Certs = init_TLS(ncconfig, genCertForced)
 	config.TlsSNI = ncconfig.tlsSNI
+	config.ReadIdleTimeoutSecond = ncconfig.dialreadTimeout
 
 	if ncconfig.listenMode || ncconfig.kcpSEnabled || ncconfig.tlsServerMode {
 		config.IsClient = false
@@ -2221,12 +2337,12 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 					return
 				}
 				defer term.Restore(int(os.Stdin.Fd()), ncconfig.term_oldstat)
-				copyWithProgress(ncconfig, nconn, input, blocksize, !nconn.IsUDP, stats_out, 0)
+				copyWithProgress(ncconfig, nconn, input, blocksize, !nconn.IsUDP, stats_out, 0, 0)
 			} else {
 				copyCharDeviceWithProgress(ncconfig, nconn, input, stats_out)
 			}
 		} else {
-			copyWithProgress(ncconfig, nconn, input, blocksize, !nconn.IsUDP, stats_out, maxSendBytes)
+			copyWithProgress(ncconfig, nconn, input, blocksize, !nconn.IsUDP, stats_out, maxSendBytes, 0)
 		}
 
 		time.Sleep(1 * time.Second)
@@ -2238,7 +2354,7 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 		defer wg.Done()
 		defer close(inExited)
 
-		copyWithProgress(ncconfig, output, nconn, bufsize, !nconn.IsUDP, stats_in, 0)
+		copyWithProgress(ncconfig, output, nconn, bufsize, !nconn.IsUDP, stats_in, 0, ncconfig.dialreadTimeout)
 		time.Sleep(1 * time.Second)
 		//ncconfig.Logger.Printf("PID:%d (%s) conn-read routine completed.\n", os.Getpid(), nconn.RemoteAddr().String())
 	}()
@@ -2310,7 +2426,12 @@ func handleConnection(console net.Conn, ncconfig *AppNetcatConfig, cfg *secure.N
 		return 1
 	}
 
-	if ncconfig.muxEnabled || ncconfig.muxLocalPort != "" {
+	if ncconfig.scanOnly {
+		nconn.Close()
+		return 0
+	}
+
+	if isEnabledMuxMode(ncconfig) {
 		return handleMuxConnection(console, ncconfig, nconn, stats_in, stats_out)
 	}
 
@@ -2318,12 +2439,16 @@ func handleConnection(console net.Conn, ncconfig *AppNetcatConfig, cfg *secure.N
 }
 
 func handleP2PConnection(console net.Conn, ncconfig *AppNetcatConfig, nconn *secure.NegotiatedConn, stats_in *misc.ProgressStats, stats_out *misc.ProgressStats) int {
+	if ncconfig.scanOnly {
+		nconn.Close()
+		return 0
+	}
 
 	ctrlPayload := easyp2p.HelloPayloadFromString(nconn.MQTTHelloCtrlPayload)
 
 	muxVal, _ := ctrlPayload.GetControlValue("mux")
 
-	if ncconfig.muxEnabled || ncconfig.muxLocalPort != "" || muxVal == "1" {
+	if isEnabledMuxMode(ncconfig) || muxVal == "1" {
 		return handleMuxConnection(console, ncconfig, nconn, stats_in, stats_out)
 	}
 
@@ -2332,13 +2457,13 @@ func handleP2PConnection(console net.Conn, ncconfig *AppNetcatConfig, nconn *sec
 
 type NetcatMuxStreamHandler func(client, server net.Conn)
 
-func runMuxListener(ncconfig *AppNetcatConfig, session interface{}, doneChan <-chan struct{}, handler NetcatMuxStreamHandler) error {
-	defer ncconfig.muxListener.Close()
+func runMuxLocalListener(ncconfig *AppNetcatConfig, session interface{}, doneChan <-chan struct{}, handler NetcatMuxStreamHandler) error {
+	defer ncconfig.muxLocalListener.Close()
 
 	// 监听 doneChan (Session 死则 Listener 死)
 	go func() {
 		<-doneChan
-		ncconfig.muxListener.Close()
+		ncconfig.muxLocalListener.Close()
 	}()
 
 	handleConn := func(c net.Conn) {
@@ -2348,13 +2473,13 @@ func runMuxListener(ncconfig *AppNetcatConfig, session interface{}, doneChan <-c
 			ncconfig.Logger.Println("mux Open failed:", err)
 			return
 		}
-		streamWithCloseWrite := newStreamWrapper(stream, "", "")
+		streamWithCloseWrite := newStreamWrapper(stream, muxSessionRemoteAddr(session), muxSessionLocalAddr(session))
 		defer streamWithCloseWrite.Close()
 		handler(c, streamWithCloseWrite)
 	}
 
 	for {
-		conn, err := ncconfig.muxListener.Accept()
+		conn, err := ncconfig.muxLocalListener.Accept()
 		if err != nil {
 			select {
 			case <-doneChan:
@@ -2369,12 +2494,17 @@ func runMuxListener(ncconfig *AppNetcatConfig, session interface{}, doneChan <-c
 }
 
 func handleMuxConnection(console net.Conn, ncconfig *AppNetcatConfig, conn net.Conn, stats_in, stats_out *misc.ProgressStats) int {
+	defer conn.Close()
 	isClient := false
-	if ncconfig.muxLocalPort != "" {
+	if isLocalMuxMode(ncconfig) {
 		isClient = true
-		if ncconfig.muxListener == nil {
-			ncconfig.Logger.Printf("invalid muxListener")
-			return 1
+		if ncconfig.muxLocalListener == nil && ncconfig.muxLocalPort != "-" {
+			ln, err := prepareLocalListener(ncconfig.muxLocalPort, false)
+			if err != nil {
+				ncconfig.Logger.Printf("Error starting local mux listener on %s: %v\n", ncconfig.muxLocalPort, err)
+				return 1
+			}
+			ncconfig.muxLocalListener = ln
 		}
 	}
 
@@ -2385,44 +2515,54 @@ func handleMuxConnection(console net.Conn, ncconfig *AppNetcatConfig, conn net.C
 	}
 
 	ncconfig.ConsoleMode = false
+	listener := newMuxListener(session)
+	defer listener.Close()
 
 	if isClient {
-		ncconfig.Logger.Printf(
-			"Mux client ready, remote service mapped to %s",
-			ncconfig.muxListener.Addr(),
-		)
-
-		sessionDone := make(chan struct{})
-		go func() {
-			defer close(sessionDone)
-			listener := newMuxListener(session)
-			stream, err := listener.Accept()
+		if ncconfig.muxLocalPort == "-" {
+			stream, err := openMuxStream(session)
 			if err != nil {
-				return
+				ncconfig.Logger.Println("mux Open failed:", err)
+				return 1
 			}
-			stream.Close()
-		}()
+			server := newStreamWrapper(stream, muxSessionRemoteAddr(session), muxSessionLocalAddr(session))
+			handleMuxChannelConnection(console, ncconfig, server, stats_in, stats_out)
+		} else {
+			ncconfig.Logger.Printf(
+				"Mux client ready, remote service mapped to %s",
+				ncconfig.muxLocalListener.Addr(),
+			)
 
-		handler := func(client, server net.Conn) {
-			cliRaddr := client.RemoteAddr().String()
-			ncconfig.Logger.Printf(
-				"Open mux stream from %s",
-				cliRaddr,
-			)
-			handleMuxChannelConnection(client, ncconfig, server, stats_in, stats_out)
-			ncconfig.Logger.Printf(
-				"Close mux stream from %s",
-				cliRaddr,
-			)
-		}
-		err = runMuxListener(ncconfig, session, sessionDone, handler)
-		if err != nil {
-			return 1
+			sessionDone := make(chan struct{})
+			go func() {
+				defer close(sessionDone)
+				stream, err := listener.Accept()
+				if err != nil {
+					return
+				}
+				stream.Close()
+			}()
+
+			handler := func(client, server net.Conn) {
+				cliRaddr := client.RemoteAddr().String()
+				ncconfig.Logger.Printf(
+					"Open mux stream from %s",
+					cliRaddr,
+				)
+				handleMuxChannelConnection(client, ncconfig, server, stats_in, stats_out)
+				ncconfig.Logger.Printf(
+					"Close mux stream from %s",
+					cliRaddr,
+				)
+			}
+			err = runMuxLocalListener(ncconfig, session, sessionDone, handler)
+			ncconfig.muxLocalListener = nil //runMuxLocalListener总是会Close它，这里重置nil
+			if err != nil {
+				return 1
+			}
 		}
 	} else {
 		ncconfig.Logger.Printf("Enter mux server mode\n")
-
-		listener := newMuxListener(session)
 		for {
 			stream, err := listener.Accept()
 			if err != nil {
