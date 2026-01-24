@@ -34,7 +34,7 @@ import (
 )
 
 var (
-	VERSION = "v2.4.9"
+	VERSION = "v2.4.11"
 )
 
 type AppNetcatConfig struct {
@@ -334,9 +334,8 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 		}
 	}
 	configureDNS(config)
-
-	config.connConfig = preinitNegotiationConfig(config)
 	swriter.Enable(config.verbose)
+	config.connConfig = preinitNegotiationConfig(config)
 	return config, nil
 }
 
@@ -417,6 +416,7 @@ func App_Netcat_main(console *misc.ConsoleIO, args []string) int {
 		return 1
 	}
 	config.ConsoleMode = true
+	misc.EnableVirtualTerminal()
 
 	return App_Netcat_main_withconfig(console, config)
 }
@@ -819,7 +819,14 @@ func configureDNS(ncconfig *AppNetcatConfig) {
 	if ncconfig.useDNS != "" {
 		setDns(ncconfig.useDNS, ncconfig.localbindIP)
 	} else if isAndroid() {
-		setDns("8.8.8.8:53", ncconfig.localbindIP)
+		googleDNS := "8.8.8.8:53"
+		if ncconfig.localbindIP != "" {
+			ip := net.ParseIP(ncconfig.localbindIP)
+			if ip != nil && ip.To16() != nil {
+				googleDNS = "[2001:4860:4860::8888]:53"
+			}
+		}
+		setDns(googleDNS, ncconfig.localbindIP)
 	}
 }
 
@@ -2771,6 +2778,14 @@ func do_P2P_multipath(ncconfig *AppNetcatConfig, enableMP bool) (*secure.Negotia
 }
 
 func setDns(dnsServer string, localIP string) {
+	// 确保端口存在
+	if strings.Contains(dnsServer, ":") {
+		if _, _, err := net.SplitHostPort(dnsServer); err != nil {
+			dnsServer = net.JoinHostPort(dnsServer, "53")
+		}
+	} else {
+		dnsServer = net.JoinHostPort(dnsServer, "53")
+	}
 	net.DefaultResolver = &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -2788,15 +2803,6 @@ func setDns(dnsServer string, localIP string) {
 						d.LocalAddr = &net.TCPAddr{IP: ip}
 					}
 				}
-			}
-
-			// 确保端口存在
-			if strings.Contains(dnsServer, ":") {
-				if _, _, err := net.SplitHostPort(dnsServer); err != nil {
-					dnsServer = net.JoinHostPort(dnsServer, "53")
-				}
-			} else {
-				dnsServer = net.JoinHostPort(dnsServer, "53")
 			}
 
 			return d.DialContext(ctx, network, dnsServer)

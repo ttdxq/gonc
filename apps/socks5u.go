@@ -73,7 +73,7 @@ type Socks5uConfig struct {
 	Username   string
 	Password   string
 	ServerIP   string
-	Localbind  string
+	Localbind  []string
 	AccessCtrl *acl.ACL
 }
 
@@ -905,17 +905,17 @@ func handleLocalUDPToTunnel(config *Socks5uConfig, localUDPConn net.PacketConn, 
 func handleDirectTCPConnect(config *Socks5uConfig, clientConn net.Conn, targetHost string, targetPort int) error {
 	targetAddr := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))
 	dialer := &net.Dialer{}
-	if config.Localbind != "" {
-		localAddr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(config.Localbind, "0"))
-		if err != nil {
-			return err
-		}
-		dialer.LocalAddr = localAddr
-	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 
-	resolvedAddr, isDenied, err := acl.ResolveAddrWithACL(ctx, config.AccessCtrl, "tcp", targetAddr)
+	config.Logger.Printf(
+		"TCP: %s->%s connecting...",
+		clientConn.RemoteAddr(),
+		targetAddr,
+	)
+
+	lResolveAddr, rResolvedAddr, isDenied, err := acl.ResolveAddrWithACL(ctx, config.AccessCtrl, "tcp", config.Localbind, targetAddr)
 	if err != nil {
 		if isDenied {
 			sendSocks5Response(clientConn, REP_CONNECTION_NOT_ALLOWED, "0.0.0.0", 0)
@@ -925,12 +925,25 @@ func handleDirectTCPConnect(config *Socks5uConfig, clientConn net.Conn, targetHo
 		return err
 	}
 
-	config.Logger.Printf("TCP: %s->%s connecting...", clientConn.RemoteAddr(), targetAddr)
-	targetConn, err := dialer.DialContext(ctx, "tcp", resolvedAddr.String())
+	dialer.LocalAddr = lResolveAddr
+	resolvedAddrStr := rResolvedAddr.String()
+
+	// 如果解析结果和原始目标不一样，说明发生了域名解析
+	if resolvedAddrStr != targetAddr {
+		config.Logger.Printf(
+			"TCP: %s->%s(%s) connecting...",
+			clientConn.RemoteAddr(),
+			targetAddr,
+			resolvedAddrStr,
+		)
+	}
+
+	targetConn, err := dialer.DialContext(ctx, "tcp", resolvedAddrStr)
 	if err != nil {
 		sendSocks5Response(clientConn, REP_GENERAL_SOCKS_SERVER_FAIL, "0.0.0.0", 0)
 		return fmt.Errorf("tunnel TCP connect failed: %v", err)
 	}
+	defer targetConn.Close()
 	sendSocks5Response(clientConn, REP_SUCCEEDED, "0.0.0.0", 0)
 	bidirectionalCopy(clientConn, targetConn)
 	return nil
@@ -1190,16 +1203,7 @@ func handleRemoteTCPConnect(config *Socks5uConfig, tunnelStream net.Conn, target
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	if config.Localbind != "" {
-		localAddr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(config.Localbind, "0"))
-		if err != nil {
-			config.Logger.Printf("Failed to ResolveTCPAddr: %v", err)
-			tunnelStream.Write([]byte(fmt.Sprintf("ERROR: %v\n", err)))
-			return
-		}
-		d.LocalAddr = localAddr
-	}
-	resolvedAddr, isDenied, err := acl.ResolveAddrWithACL(ctx, config.AccessCtrl, "tcp", targetAddr)
+	lresolvedAddr, rResolvedAddr, isDenied, err := acl.ResolveAddrWithACL(ctx, config.AccessCtrl, "tcp", config.Localbind, targetAddr)
 	if err != nil {
 		if isDenied {
 			config.Logger.Printf("Access control denied for target %s", targetAddr)
@@ -1210,7 +1214,9 @@ func handleRemoteTCPConnect(config *Socks5uConfig, tunnelStream net.Conn, target
 		return
 	}
 
-	targetConn, err := d.Dial("tcp", resolvedAddr.String())
+	d.LocalAddr = lresolvedAddr
+
+	targetConn, err := d.Dial("tcp", rResolvedAddr.String())
 	if err != nil {
 		config.Logger.Printf("Failed to connect to target %s: %v", targetAddr, err)
 		// 向流写入错误响应
@@ -1240,10 +1246,14 @@ func handleRemoteTCPConnect(config *Socks5uConfig, tunnelStream net.Conn, target
 func handleRemoteUDPAssociate(config *Socks5uConfig, tunnelStream net.Conn) {
 	// 远端创建一个通用的 UDP socket，用于向任意目标发送和接收 UDP 包
 	// 绑定到 0.0.0.0:0，让操作系统选择一个可用端口
-	localAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(config.Localbind, "0"))
-	if err != nil {
-		tunnelStream.Write([]byte(fmt.Sprintf("ERROR: Failed to ResolveUDPAddr: %v\n", err)))
-		return
+	var localAddr *net.UDPAddr
+	if len(config.Localbind) > 0 {
+		lAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(config.Localbind[0], "0"))
+		if err != nil {
+			tunnelStream.Write([]byte(fmt.Sprintf("ERROR: Failed to ResolveUDPAddr: %v\n", err)))
+			return
+		}
+		localAddr = lAddr
 	}
 
 	remoteLocalUDPConn, err := net.ListenUDP("udp", localAddr)
@@ -1380,7 +1390,7 @@ func handleRemoteUDPAssociate(config *Socks5uConfig, tunnelStream net.Conn) {
 				config.Logger.Printf("UDP: %s->%s (first outbound packet of session)", remoteLocalUDPConn.LocalAddr().String(), net.JoinHostPort(targetHost, strconv.Itoa(targetPort)))
 			})
 
-			targetAddr, isDenied, resolveErr := acl.ResolveAddrWithACL(context.Background(), config.AccessCtrl, "udp", net.JoinHostPort(targetHost, strconv.Itoa(targetPort)))
+			_, targetAddr, isDenied, resolveErr := acl.ResolveAddrWithACL(context.Background(), config.AccessCtrl, "udp", config.Localbind, net.JoinHostPort(targetHost, strconv.Itoa(targetPort)))
 			if resolveErr != nil {
 				if isDenied {
 					config.Logger.Printf("Denied to resolve target UDP address %s:%d: %v", targetHost, targetPort, resolveErr)
@@ -1845,6 +1855,7 @@ func (c *Socks5Client) Listen(network, address string) (net.Listener, error) {
 	}, nil
 }
 
+// timeout 是指于Socks5服务器建立BIND过程的超时时间，不是Listen的等待超时
 func (c *Socks5Client) RemoteListen(network, address string, timeout time.Duration) (*Socks5BindConn, error) {
 	host, portStr, err := net.SplitHostPort(address)
 	if err != nil {
