@@ -181,7 +181,7 @@ func App_mux_usage(logWriter io.Writer) {
 	fmt.Fprintln(logWriter, "   :mux socks5")
 	fmt.Fprintln(logWriter, "   :mux linkagent")
 	fmt.Fprintln(logWriter, "   :mux link <L-Config>;<R-Config> (e.g. mux link x://127.0.0.1:8000;none)")
-	fmt.Fprintln(logWriter, "   :mux httpserver <rootDir1> <rootDir2>...")
+	fmt.Fprintln(logWriter, "   :mux httpserver <rootDir1> <rootDir2>... (serve multiple dirs with virtual paths)")
 	fmt.Fprintln(logWriter, "   :mux httpclient <saveDir> <remotePath>")
 	fmt.Fprintln(logWriter, "   :mux -l listen_port")
 }
@@ -411,6 +411,7 @@ type linkRuntimeConfig struct {
 	TargetHost          string
 	TargetPort          int
 	ForwardTarget       string
+	ForwardProto        string // "tcp"(默认), "udp", "all"
 }
 
 // setupLinkRuntimeConfig 负责在 Accept 之前完成所有配置分析、TLS加载和参数校验
@@ -479,7 +480,16 @@ func setupLinkRuntimeConfig(muxcfg *MuxSessionConfig, scheme string, params url.
 			return nil, fmt.Errorf("invalid target address '%s': %v", cfg.ForwardTarget, err)
 		}
 		cfg.TargetPort, _ = strconv.Atoi(pStr)
-		muxcfg.Logger.Printf("[link-f] Listening on %s -> Forward to %s\n", ln.Addr().String(), cfg.ForwardTarget)
+		cfg.ForwardProto = params.Get("proto")
+		if cfg.ForwardProto == "" {
+			cfg.ForwardProto = "tcp"
+		}
+		switch cfg.ForwardProto {
+		case "tcp", "udp", "all":
+		default:
+			return nil, fmt.Errorf("invalid proto '%s', use tcp/udp/all", cfg.ForwardProto)
+		}
+		muxcfg.Logger.Printf("[link-f] Listening on %s -> Forward to %s (proto=%s)\n", ln.Addr().String(), cfg.ForwardTarget, cfg.ForwardProto)
 	case "raw":
 		muxcfg.Logger.Printf("[listen] Listening on %s\n", ln.Addr().String())
 		if params.Get("mode") == "httpserver" {
@@ -507,6 +517,24 @@ func runLinkListener(muxcfg *MuxSessionConfig, session interface{}, ln net.Liste
 		<-doneChan
 		ln.Close()
 	}()
+
+	// 启动 UDP 转发（f:// 模式，proto=udp 或 proto=all）
+	if scheme == "f" && (rtConfig.ForwardProto == "udp" || rtConfig.ForwardProto == "all") {
+		go startUDPForward(muxcfg, session, ln.Addr().String(), rtConfig.TargetHost, rtConfig.TargetPort, doneChan)
+	}
+
+	// 如果是纯 UDP 模式，不需要 TCP accept 循环
+	if scheme == "f" && rtConfig.ForwardProto == "udp" {
+		<-doneChan
+		return fmt.Errorf("forward session closed")
+	}
+
+	// 启动 UDP 透明代理（与 TCP 监听并行）
+	if scheme == "x" && rtConfig.UseTProxy {
+		_, portStr, _ := net.SplitHostPort(ln.Addr().String())
+		listenPort, _ := strconv.Atoi(portStr)
+		go startUDPTProxy(muxcfg, session, listenPort, rtConfig.TProxyAllowPublicIP, doneChan)
+	}
 
 	handleConn := func(c net.Conn, magicIP string) {
 		// tls处理

@@ -421,7 +421,7 @@ func GetPublicIPs(network, bind string, timeout time.Duration, natIPUniq bool, s
 				tcpConn.SetLinger(0)
 			}
 
-			client, err := stun.NewClient(conn)
+			client, err := stun.NewClient(conn, stun.WithRTO(120*time.Millisecond))
 			if err != nil {
 				resultsChan <- STUNResult{Index: index, Network: useNetwork, Err: fmt.Errorf("STUN NewClient failed: %v", err)}
 				return

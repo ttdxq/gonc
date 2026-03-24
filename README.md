@@ -194,9 +194,9 @@ On the sender side, start an HTTP file server to expose the files or directories
 
     `gonc.exe -tls -psk passphrase -e :s5s -keep-open -acl acl.txt -P -l 1080`
 
-    On the other side, use `:nc` (built-in nc command) to convert Socks5 over TLS to standard Socks5, providing local client access on 127.0.0.1:3080:
+    On the other side, use `:s5c` (built-in s5c command) to convert Socks5 over TLS to standard Socks5, providing local client access on 127.0.0.1:3080:
 
-    `gonc.exe -e ":nc -tls -psk passphrase x.x.x.x 1080" -keep-open -l -local 127.0.0.1:3080`
+    `gonc.exe -e ":s5c -tls -psk passphrase x.x.x.x 1080" -keep-open -l -local 127.0.0.1:3080`
 
 ### Establishing a Tunnel for Other Applications
  - Assist WireGuard in NAT Traversal to Form a VPN

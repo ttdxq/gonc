@@ -35,6 +35,12 @@ func (tw *SwitchableWriter) Enable(b bool) {
 	tw.mu.Unlock()
 }
 
+func (tw *SwitchableWriter) SetOutput(w io.Writer) {
+	tw.mu.Lock()
+	tw.w = w
+	tw.mu.Unlock()
+}
+
 // 计算显示长度（遇到 \r 或 \n 停止）
 func visibleLen(p []byte) int {
 	n := 0

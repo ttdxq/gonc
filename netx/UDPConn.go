@@ -45,10 +45,11 @@ func NewBoundUDPConn(conn net.PacketConn, raddr string, keepOpen bool) *BoundUDP
 		}
 	}
 	return &BoundUDPConn{
-		conn:       conn,
-		remoteAddr: remoteAddr,
-		keepOpen:   keepOpen,
-		closeChan:  make(chan struct{}),
+		conn:           conn,
+		remoteAddr:     remoteAddr,
+		keepOpen:       keepOpen,
+		closeChan:      make(chan struct{}),
+		lastActiveTime: time.Now(),
 	}
 }
 
@@ -148,7 +149,7 @@ func (b *BoundUDPConn) Read(p []byte) (int, error) {
 			continue
 
 		case isTimeout(err):
-			if b.idleTimeout > 0 && !b.lastActiveTime.IsZero() {
+			if b.idleTimeout > 0 {
 				if time.Since(b.lastActiveTime) > b.idleTimeout {
 					return 0, fmt.Errorf("idle timeout: no data received for %s", b.idleTimeout)
 				}

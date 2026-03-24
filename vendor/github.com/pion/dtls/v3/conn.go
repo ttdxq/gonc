@@ -153,7 +153,7 @@ func createConn(
 	}
 
 	workerInterval := initialTickerInterval
-	if config.FlightInterval != 0 {
+	if config.FlightInterval > 0 {
 		workerInterval = config.FlightInterval
 	}
 
@@ -793,8 +793,10 @@ func (c *Conn) readAndBuffer(ctx context.Context) error { //nolint:cyclop
 }
 
 func (c *Conn) handleQueuedPackets(ctx context.Context) error {
+	c.lock.Lock()
 	pkts := c.encryptedPackets
 	c.encryptedPackets = nil
+	c.lock.Unlock()
 
 	for _, p := range pkts {
 		_, _, alert, err := c.handleIncomingPacket(ctx, p.data, p.rAddr, false) // don't re-enqueue
@@ -818,6 +820,9 @@ func (c *Conn) handleQueuedPackets(ctx context.Context) error {
 }
 
 func (c *Conn) enqueueEncryptedPackets(packet addrPkt) bool {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
 	if len(c.encryptedPackets) < maxAppDataPacketQueueSize {
 		c.encryptedPackets = append(c.encryptedPackets, packet)
 

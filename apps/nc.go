@@ -34,7 +34,7 @@ import (
 )
 
 var (
-	VERSION = "v2.4.11"
+	VERSION = "v2.4.13"
 )
 
 type AppNetcatConfig struct {
@@ -56,7 +56,9 @@ type AppNetcatConfig struct {
 	app_mux_Config        *AppMuxConfig
 	app_s5s_args          string
 	app_s5s_Config        *AppS5SConfig
+	app_s5c_Config        *AppS5CConfig
 	arg_proxyc_Config     *ProxyClientConfig
+	arg_proxyc_Client     *ProxyClient // 预构建的代理客户端（用于链式代理）
 	fallbackRelayMode     bool
 	app_sh_args           string
 	app_sh_Config         *PtyShellConfig
@@ -115,6 +117,7 @@ type AppNetcatConfig struct {
 	useMutilPath      bool
 	useMQTTWait       bool
 	useMQTTHello      bool
+	useLAN            bool
 	MQTTHelloPayload  easyp2p.HelloPayload
 	useIPv4           bool
 	useIPv6           bool
@@ -145,6 +148,8 @@ type AppNetcatConfig struct {
 	muxLocalListener  net.Listener
 	dialreadTimeout   int
 	scanOnly          bool
+	daemon            bool
+	outputLogFile     string
 }
 
 // AppNetcatConfigByArgs 解析给定的 []string 参数，生成 AppNetcatConfig
@@ -170,7 +175,7 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 
 	// 定义命令行参数
 	fs.StringVar(&config.proxyProt, "X", "", "proxy_protocol. Supported protocols are “5” (SOCKS v.5) and “connect” (HTTPS proxy).  If the protocol is not specified, SOCKS version 5 is used.")
-	fs.StringVar(&config.proxyAddr, "x", "", "\"[options: -tls -psk] ip:port\" for proxy_address")
+	fs.StringVar(&config.proxyAddr, "x", "", "proxy_address. Classic: \"[options: -tls -psk] ip:port\"; URL: \"socks5://[user:pass@]host:port[?psk=key]\"; Chain: \"socks5://host1:port,https://host2:port\"")
 	fs.StringVar(&config.proxyAddr2, "x2", "", "Proxy address (same format as -x). Only used if P2P connection fails.")
 	fs.StringVar(&config.auth, "auth", "", "user:password for proxy")
 	fs.StringVar(&config.sendfile, "send", "", "path to file to send (optional)")
@@ -211,6 +216,7 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	fs.BoolVar(&config.useMQTTWait, "W", false, "alias for -mqtt-wait")
 	fs.BoolVar(&config.useMQTTHello, "mqtt-hello", false, "send MQTT hello message before initiating P2P connection")
 	fs.BoolVar(&config.useMQTTHello, "H", false, "alias for -mqtt-hello")
+	fs.BoolVar(&config.useLAN, "lan", false, "use LAN broadcast discovery instead of STUN/MQTT for P2P (can combine with -W/-H)")
 	fs.BoolVar(&config.useIPv4, "4", false, "Forces to use IPv4 addresses only")
 	fs.BoolVar(&config.useIPv6, "6", false, "Forces to use IPv4 addresses only")
 	fs.StringVar(&config.useDNS, "dns", "", "set DNS Server")
@@ -235,6 +241,8 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	fs.StringVar(&config.muxLocalPort, "mux-l", "", "Client mux mode: local listen port or '-' for stdin/stdout")
 	fs.IntVar(&config.dialreadTimeout, "w", 0, "timeout in seconds for dialing or idle reads (0 = disabled)")
 	fs.BoolVar(&config.scanOnly, "z", false, "connection test mode (establish connection only, no data transfer")
+	fs.BoolVar(&config.daemon, "daemon", false, "run in background (daemon mode)")
+	fs.StringVar(&config.outputLogFile, "log", "", "output log to file")
 
 	fs.StringVar(&config.runCmd, "e", "", "alias for -exec")
 	fs.BoolVar(&config.progressEnabled, "P", false, "alias for -progress")
@@ -285,7 +293,7 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	}
 	config.Args = fs.Args()
 	if config.verbose {
-		if config.verboseWithTime || config.keepOpen || isAppModeRequiredKeepOpen(config) || argv0 == ":nc" {
+		if config.verboseWithTime || config.keepOpen || isAppModeRequiredKeepOpen(config) || strings.HasPrefix(argv0, ":") {
 			prefix := ""
 			if argv0 != "" {
 				prefix = fmt.Sprintf("[%s] ", argv0)
@@ -293,6 +301,23 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 			config.Logger = misc.NewLog(swriter, prefix, log.LstdFlags|log.Lmsgprefix)
 			config.verboseWithTime = true
 		}
+	}
+
+	if config.daemon {
+		if err := daemonize(config); err != nil {
+			// daemonize may call os.Exit on success; error means we failed to start background process
+			fmt.Fprintf(logWriter, "Failed to daemonize: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	if config.outputLogFile != "" {
+		logFile, err := os.OpenFile(config.outputLogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			fmt.Fprintf(logWriter, "Failed to open log file %s: %v\n", config.outputLogFile, err)
+			os.Exit(1)
+		}
+		swriter.SetOutput(logFile)
 	}
 
 	// 1. 初始化基本设置
@@ -645,14 +670,37 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 		ncconfig.fallbackRelayMode = true
 	}
 	if xcommandline != "" {
-		xconfig, err := ProxyClientConfigByCommandline(ncconfig.LogWriter, ncconfig.proxyProt, ncconfig.auth, xcommandline)
-		if err != nil {
-			if err != flag.ErrHelp {
-				ncconfig.Logger.Printf("Error init proxy config: %v\n", err)
+		if IsProxyURLFormat(xcommandline) {
+			// URL 格式: socks5://user:pass@host:port,https://host2:port2
+			parts := splitProxyChain(xcommandline)
+			if len(parts) == 1 {
+				// 单跳 URL，转为 ProxyClientConfig 保持兼容
+				xconfig, err := ParseProxyURL(ncconfig.LogWriter, parts[0])
+				if err != nil {
+					ncconfig.Logger.Printf("Error parse proxy URL: %v\n", err)
+					os.Exit(1)
+				}
+				ncconfig.arg_proxyc_Config = xconfig
+			} else {
+				// 多跳链式代理
+				chainClient, err := ParseProxyChainURL(ncconfig.LogWriter, xcommandline)
+				if err != nil {
+					ncconfig.Logger.Printf("Error parse proxy chain: %v\n", err)
+					os.Exit(1)
+				}
+				ncconfig.arg_proxyc_Client = chainClient
 			}
-			os.Exit(1)
+		} else {
+			// 旧格式: -x "ip:port" 或 -x "-tls -psk key ip:port"
+			xconfig, err := ProxyClientConfigByCommandline(ncconfig.LogWriter, ncconfig.proxyProt, ncconfig.auth, xcommandline)
+			if err != nil {
+				if err != flag.ErrHelp {
+					ncconfig.Logger.Printf("Error init proxy config: %v\n", err)
+				}
+				os.Exit(1)
+			}
+			ncconfig.arg_proxyc_Config = xconfig
 		}
-		ncconfig.arg_proxyc_Config = xconfig
 	}
 	if ncconfig.natchecker {
 		ncconfig.featureModulesRun = append(ncconfig.featureModulesRun, "nat-checker")
@@ -749,14 +797,22 @@ func determineNetworkAndAddress(ncconfig *AppNetcatConfig) (network, host, port,
 		} else if ncconfig.autoP2P != "" {
 			ncconfig.listenMode = false
 			P2PSessionKey = ncconfig.autoP2P
-			network = "any"
-			if ncconfig.udpProtocol {
-				network = "udp"
-			}
-			if ncconfig.useIPv4 {
-				network += "4"
-			} else if ncconfig.useIPv6 {
-				network += "6"
+			if ncconfig.useLAN {
+				if ncconfig.udpProtocol {
+					network = "udp4"
+				} else {
+					network = "tcp4"
+				}
+			} else {
+				network = "any"
+				if ncconfig.udpProtocol {
+					network = "udp"
+				}
+				if ncconfig.useIPv4 {
+					network += "4"
+				} else if ncconfig.useIPv6 {
+					network += "6"
+				}
 			}
 			if strings.HasPrefix(P2PSessionKey, "@") {
 				P2PSessionKey, err = secure.ReadPSKFile(P2PSessionKey)
@@ -788,6 +844,9 @@ func determineNetworkAndAddress(ncconfig *AppNetcatConfig) (network, host, port,
 				}
 				if isLocalMuxMode(ncconfig) {
 					ncconfig.MQTTHelloPayload.SetControlValue("mux", "1")
+					if ncconfig.useLAN {
+						ncconfig.MQTTHelloPayload.SetControlValue("lan", "1")
+					}
 				}
 			}
 			if isTLSEnabled(ncconfig) {
@@ -796,7 +855,10 @@ func determineNetworkAndAddress(ncconfig *AppNetcatConfig) (network, host, port,
 				}
 			}
 
-			if ncconfig.arg_proxyc_Config != nil {
+			if hasProxyConfig(ncconfig) {
+				if ncconfig.arg_proxyc_Client != nil {
+					return network, "", "", "", fmt.Errorf("proxy chain is not supported with p2p mode")
+				}
 				if ncconfig.arg_proxyc_Config.Prot != "socks5" {
 					return network, "", "", "", fmt.Errorf("only allow socks5 proxy with p2p")
 				}
@@ -879,7 +941,7 @@ func runP2PMode(console net.Conn, ncconfig *AppNetcatConfig) int {
 
 // runListenMode 在监听模式下启动服务器
 func runListenMode(console net.Conn, ncconfig *AppNetcatConfig, network, host, port string) int {
-	if ncconfig.arg_proxyc_Config == nil {
+	if !hasProxyConfig(ncconfig) {
 		if port == "0" {
 			portInt, err := easyp2p.GetFreePort()
 			if err != nil {
@@ -919,6 +981,8 @@ func startUDPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 		return 1
 	}
 	defer uconn.Close()
+	uconn.SetReadBuffer(512 * 1024)
+	uconn.SetWriteBuffer(512 * 1024)
 	ncconfig.Logger.Printf("Listening %s on %s\n", uconn.LocalAddr().Network(), uconn.LocalAddr().String())
 
 	logDiscard := misc.NewLog(io.Discard, "[UDPSession] ", log.LstdFlags|log.Lmsgprefix)
@@ -1018,7 +1082,7 @@ func startTCPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 	var listener net.Listener
 	var err error
 	socks5BindMode := false
-	proxyClient, err := NewProxyClient(ncconfig.arg_proxyc_Config)
+	proxyClient, err := getProxyClient(ncconfig)
 	if err != nil {
 		ncconfig.Logger.Printf("Error create proxy client: %v\n", err)
 		return 1
@@ -1181,7 +1245,7 @@ func runDialMode(console net.Conn, ncconfig *AppNetcatConfig, network, host, por
 	var conn net.Conn
 	var err error
 
-	proxyClient, err := NewProxyClient(ncconfig.arg_proxyc_Config)
+	proxyClient, err := getProxyClient(ncconfig)
 	if err != nil {
 		ncconfig.Logger.Printf("Error create proxy client: %v\n", err)
 		return 1
@@ -1246,7 +1310,7 @@ func runDialMode(console net.Conn, ncconfig *AppNetcatConfig, network, host, por
 	remoteTargetAddr := net.JoinHostPort(host, port)
 	if strings.HasPrefix(conn.LocalAddr().Network(), "udp") {
 		proxyRemoteAddr := ""
-		if ncconfig.arg_proxyc_Config != nil {
+		if hasProxyConfig(ncconfig) {
 			if pktConn, ok := conn.(*netx.ConnFromPacketConn); ok {
 				if s5conn, ok := pktConn.PacketConn.(*Socks5UDPPacketConn); ok {
 					proxyRemoteAddr = s5conn.GetUDPAssociateAddr().String()
@@ -1261,7 +1325,7 @@ func runDialMode(console net.Conn, ncconfig *AppNetcatConfig, network, host, por
 			offTip = fmt.Sprintf("UDP closed for: %s", remoteTargetAddr)
 		}
 	} else {
-		if ncconfig.arg_proxyc_Config == nil {
+		if !hasProxyConfig(ncconfig) {
 			onTip = fmt.Sprintf("Connected to: %s", conn.RemoteAddr().String())
 			offTip = fmt.Sprintf("Disconnected from: %s", conn.RemoteAddr().String())
 		} else {
@@ -1618,10 +1682,10 @@ func init_TLS(ncconfig *AppNetcatConfig, genCertForced bool) []tls.Certificate {
 		}
 		if genCertForced || ncconfig.tlsServerMode {
 			if ncconfig.sslCertFile != "" && ncconfig.sslKeyFile != "" {
-				fmt.Fprintf(ncconfig.LogWriter, "Loading cert...")
+				ncconfig.Logger.Printf("Loading cert...")
 				cert, err := secure.LoadCertificate(ncconfig.sslCertFile, ncconfig.sslKeyFile)
 				if err != nil {
-					fmt.Fprintf(ncconfig.LogWriter, "Error load certificate: %v\n", err)
+					ncconfig.Logger.Printf("Error load certificate: %v\n", err)
 					os.Exit(1)
 				}
 				certs = append(certs, *cert)
@@ -1629,34 +1693,34 @@ func init_TLS(ncconfig *AppNetcatConfig, genCertForced bool) []tls.Certificate {
 				ncconfig.tlsRSACertEnabled = false
 			} else {
 				if !ncconfig.tlsECCertEnabled && !ncconfig.tlsRSACertEnabled {
-					fmt.Fprintf(ncconfig.LogWriter, "EC and RSA both are disabled\n")
+					ncconfig.Logger.Printf("EC and RSA both are disabled\n")
 					os.Exit(1)
 				}
 				if ncconfig.tlsECCertEnabled {
 					if ncconfig.presharedKey != "" {
-						fmt.Fprintf(ncconfig.LogWriter, "Generating ECDSA(PSK-derived) cert for secure communication...")
+						ncconfig.Logger.Printf("Generating ECDSA(PSK-derived) cert for secure communication...")
 					} else {
-						fmt.Fprintf(ncconfig.LogWriter, "Generating ECDSA(randomly) cert for secure communication...")
+						ncconfig.Logger.Printf("Generating ECDSA(randomly) cert for secure communication...")
 					}
 					cert, err := secure.GenerateECDSACertificate(ncconfig.tlsSNI, ncconfig.presharedKey)
 					if err != nil {
-						fmt.Fprintf(ncconfig.LogWriter, "Error generating EC certificate: %v\n", err)
+						ncconfig.Logger.Printf("Error generating EC certificate: %v\n", err)
 						os.Exit(1)
 					}
 					certs = append(certs, *cert)
 				}
 				if ncconfig.tlsRSACertEnabled {
-					fmt.Fprintf(ncconfig.LogWriter, "Generating RSA cert...")
+					ncconfig.Logger.Printf("Generating RSA cert...")
 					cert, err := secure.GenerateRSACertificate(ncconfig.tlsSNI)
 					if err != nil {
-						fmt.Fprintf(ncconfig.LogWriter, "Error generating RSA certificate: %v\n", err)
+						ncconfig.Logger.Printf("Error generating RSA certificate: %v\n", err)
 						os.Exit(1)
 					}
 					certs = append(certs, *cert)
 				}
 			}
 
-			fmt.Fprintf(ncconfig.LogWriter, "completed.\n")
+			ncconfig.Logger.Printf("Certificate initialization completed.")
 		}
 	}
 	return certs
@@ -1741,6 +1805,7 @@ func usage_full(argv0 string, fs *flag.FlagSet) {
 	fmt.Fprintln(fs.Output(), "Built-in commands for -e option:")
 	fmt.Fprintf(fs.Output(), "  %-6s %s\n", ":mux", "Stream-multiplexing proxy")
 	fmt.Fprintf(fs.Output(), "  %-6s %s\n", ":s5s", "SOCKS5 server")
+	fmt.Fprintf(fs.Output(), "  %-6s %s\n", ":s5c", "SOCKS5 client")
 	fmt.Fprintf(fs.Output(), "  %-6s %s\n", ":nc", "netcat")
 	fmt.Fprintf(fs.Output(), "  %-6s %s\n", ":sh", "pseudo-terminal shell")
 	fmt.Fprintf(fs.Output(), "  %-6s %s\n", ":tp", "transparent proxy")
@@ -1754,7 +1819,7 @@ func usage_full(argv0 string, fs *flag.FlagSet) {
 func usage_less(logWriter io.Writer, argv0 string) {
 	fmt.Fprintln(logWriter, "go-netcat "+VERSION)
 	fmt.Fprintln(logWriter, "Usage:")
-	fmt.Fprintf(logWriter, "    %s [-x socks5_ip:port] [-auth user:pass] [-send path] [-tls] [-l] [-u] target_host target_port\n", argv0)
+	fmt.Fprintln(logWriter, "   ", argv0, "[-x socks5_ip:port] [-auth user:pass] [-send path] [-tls] [-l] [-u] target_host target_port")
 	fmt.Fprintln(logWriter, "         [-p2p sessionKey]")
 	fmt.Fprintln(logWriter, "         [-e \":builtin-command [args]\" or \"external-command [args]\"]")
 	fmt.Fprintln(logWriter, "         [-h] for full help")
@@ -1864,6 +1929,8 @@ func preinitBuiltinAppConfig(ncconfig *AppNetcatConfig, commandline string) erro
 		if err == nil {
 			ncconfig.app_s5s_Config.AccessCtrl = ncconfig.accessControl
 		}
+	case ":s5c":
+		ncconfig.app_s5c_Config, err = AppS5CConfigByArgs(ncconfig.LogWriter, args[1:])
 	case ":nc":
 		ncconfig.app_nc_Config, err = AppNetcatConfigByArgs(ncconfig.LogWriter, ":nc", args[1:])
 	case ":sh":
@@ -2019,6 +2086,11 @@ func preinitNegotiationConfig(ncconfig *AppNetcatConfig) *secure.NegotiationConf
 	config.Certs = init_TLS(ncconfig, genCertForced)
 	config.TlsSNI = ncconfig.tlsSNI
 	config.ReadIdleTimeoutSecond = ncconfig.dialreadTimeout
+	if ncconfig.dialreadTimeout != 0 {
+		if config.UDPIdleTimeoutSecond == secure.DefaultUDPIdleTimeoutSecond {
+			config.UDPIdleTimeoutSecond = ncconfig.dialreadTimeout
+		}
+	}
 
 	if ncconfig.listenMode || ncconfig.kcpSEnabled || ncconfig.tlsServerMode {
 		config.IsClient = false
@@ -2214,6 +2286,16 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 			output = pipeConn.Out
 			defer pipeConn.Close()
 			go App_s5s_main_withconfig(pipeConn, nconn.KeyingMaterial, ncconfig.app_s5s_Config, stats_in, stats_out)
+		} else if builtinApp == ":s5c" {
+			if ncconfig.app_s5c_Config == nil {
+				ncconfig.Logger.Printf("Not initialized %s config\n", builtinApp)
+				return 1
+			}
+			pipeConn := misc.NewPipeConn(nconn)
+			input = pipeConn.In
+			output = pipeConn.Out
+			defer pipeConn.Close()
+			go App_s5c_main_withconfig(pipeConn, nconn.KeyingMaterial, ncconfig.app_s5c_Config, stats_in, stats_out)
 		} else if builtinApp == ":nc" {
 			if ncconfig.app_nc_Config == nil {
 				ncconfig.Logger.Printf("Not initialized %s config\n", builtinApp)
@@ -2663,30 +2745,84 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 		}
 	}
 
-	var relayConn *easyp2p.RelayPacketConn
-	socks5UDPClient, err := CreateSocks5UDPClient(ncconfig.arg_proxyc_Config)
-	if err != nil {
-		ReportP2PStatus(ncconfig, topicSalt, fmt.Sprintf("error: socks5: %v", err), ncconfig.network, "", "")
-		return nil, fmt.Errorf("prepare socks5 UDP client failed: %v", err)
-	} else if socks5UDPClient != nil {
-		relayConn = &easyp2p.RelayPacketConn{
-			PacketConn: socks5UDPClient,
+	var connInfo *easyp2p.P2PConnInfo
+
+	if ncconfig.useLAN {
+		// ─── LAN 模式分支 ───
+		transportPref := easyp2p.LANTransportFromConfig(ncconfig.udpProtocol)
+		connInfo, err = easyp2p.Easy_P2P_LAN(ncconfig.ctx, ncconfig.p2pSessionKey+topicSalt, transportPref, 90*time.Second, ncconfig.LogWriter)
+		if err != nil {
+			ReportP2PStatus(ncconfig, topicSalt, fmt.Sprintf("error:%v", err), ncconfig.network, "", "")
+			return nil, err
 		}
-		if ncconfig.fallbackRelayMode {
-			relayConn.FallbackMode = true
+	} else {
+		// ─── STUN/NAT 打洞 ───
+		var relayConn *easyp2p.RelayPacketConn
+		socks5UDPClient, err := CreateSocks5UDPClient(ncconfig.arg_proxyc_Config)
+		if err != nil {
+			ReportP2PStatus(ncconfig, topicSalt, fmt.Sprintf("error: socks5: %v", err), ncconfig.network, "", "")
+			return nil, fmt.Errorf("prepare socks5 UDP client failed: %v", err)
+		} else if socks5UDPClient != nil {
+			relayConn = &easyp2p.RelayPacketConn{
+				PacketConn: socks5UDPClient,
+			}
+			if ncconfig.fallbackRelayMode {
+				relayConn.FallbackMode = true
+			}
+		}
+
+		//sessionKey+topicSalt组合成和对端单独共享的mqtt topic
+		connInfo, err = easyp2p.Easy_P2P_MP(ncconfig.ctx, ncconfig.network, ncconfig.localbind, ncconfig.p2pSessionKey+topicSalt, false, relayConn, ncconfig.LogWriter)
+		if err != nil {
+			if relayConn != nil {
+				relayConn.Close()
+			}
+			ReportP2PStatus(ncconfig, topicSalt, fmt.Sprintf("error:%v", err), ncconfig.network, "", "")
+			return nil, err
 		}
 	}
 
-	//sessionKey+topicSalt组合成和对端单独共享的mqtt topic
-	connInfo, err := easyp2p.Easy_P2P_MP(ncconfig.ctx, ncconfig.network, ncconfig.localbind, ncconfig.p2pSessionKey+topicSalt, false, relayConn, ncconfig.LogWriter)
+	rawconn := connInfo.Conns[0]
+	nconn, err := p2pSecureNegotiation(ncconfig, connInfo, cipherSuite, ncconfig.useLAN)
 	if err != nil {
-		if relayConn != nil {
-			relayConn.Close()
-		}
+		rawconn.Close()
 		ReportP2PStatus(ncconfig, topicSalt, fmt.Sprintf("error:%v", err), ncconfig.network, "", "")
 		return nil, err
 	}
+	if nconn.IsUDP {
+		proxyRemoteAddr := ""
+		if pktConn, ok := rawconn.(*netx.ConnFromPacketConn); ok {
+			if s5conn, ok := pktConn.PacketConn.(*Socks5UDPPacketConn); ok {
+				proxyRemoteAddr = s5conn.GetUDPAssociateAddr().String()
+			}
+		}
+		if proxyRemoteAddr != "" {
+			ncconfig.Logger.Printf("UDP ready for: %s -> %s -> %s\n", rawconn.LocalAddr().String(), proxyRemoteAddr, rawconn.RemoteAddr().String())
+		} else {
+			ncconfig.Logger.Printf("UDP ready for: %s -> %s\n", rawconn.LocalAddr().String(), rawconn.RemoteAddr().String())
+		}
+	} else {
+		ncconfig.Logger.Printf("Connected to: %s\n", rawconn.RemoteAddr().String())
+	}
+	statusNetwork := strings.Join(connInfo.NetworksUsed, "+")
+	statusMode := "P2P"
+	if connInfo.RelayUsed {
+		statusMode = "Relay"
+	}
+	ReportP2PStatus(ncconfig, topicSalt, "connected", statusNetwork, statusMode, connInfo.PeerAddress)
+	preOnClose := nconn.OnClose
+	nconn.OnClose = func() {
+		ReportP2PStatus(ncconfig, topicSalt, "disconnected", statusNetwork, statusMode, connInfo.PeerAddress)
+		if preOnClose != nil {
+			preOnClose()
+		}
+	}
+	nconn.MQTTHelloCtrlPayload = helloPayload.CtrlString()
+	nconn.MQTTHelloAppPayload = helloPayload.AppString()
+	return nconn, nil
+}
 
+func p2pSecureNegotiation(ncconfig *AppNetcatConfig, connInfo *easyp2p.P2PConnInfo, cipherSuite string, lanMode bool) (*secure.NegotiatedConn, error) {
 	conn := connInfo.Conns[0]
 	config := *ncconfig.connConfig
 	config.IsClient = connInfo.IsClient
@@ -2702,11 +2838,19 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 		}
 		if ncconfig.autoPSK {
 			config.Key = string(connInfo.SharedKey[:])
-			config.KeyType = "ECDHE"
+			if lanMode {
+				config.KeyType = "PSK"
+			} else {
+				config.KeyType = "ECDHE"
+			}
 		}
 	case "ss":
 		config.Key = string(connInfo.SharedKey[:])
-		config.KeyType = "ECDHE"
+		if lanMode {
+			config.KeyType = "PSK"
+		} else {
+			config.KeyType = "ECDHE"
+		}
 
 		if strings.HasPrefix(conn.LocalAddr().Network(), "udp") {
 			config.KcpWithUDP = true
@@ -2730,43 +2874,7 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 		return nil, fmt.Errorf("unsupported cipher suite: %s", cipherSuite)
 	}
 
-	nconn, err := secure.DoNegotiation(&config, conn, ncconfig.LogWriter)
-	if err != nil {
-		conn.Close()
-		ReportP2PStatus(ncconfig, topicSalt, fmt.Sprintf("error:%v", err), ncconfig.network, "", "")
-		return nil, err
-	}
-	if nconn.IsUDP {
-		proxyRemoteAddr := ""
-		if pktConn, ok := conn.(*netx.ConnFromPacketConn); ok {
-			if s5conn, ok := pktConn.PacketConn.(*Socks5UDPPacketConn); ok {
-				proxyRemoteAddr = s5conn.GetUDPAssociateAddr().String()
-			}
-		}
-		if proxyRemoteAddr != "" {
-			ncconfig.Logger.Printf("UDP ready for: %s -> %s -> %s\n", conn.LocalAddr().String(), proxyRemoteAddr, conn.RemoteAddr().String())
-		} else {
-			ncconfig.Logger.Printf("UDP ready for: %s -> %s\n", conn.LocalAddr().String(), conn.RemoteAddr().String())
-		}
-	} else {
-		ncconfig.Logger.Printf("Connected to: %s\n", conn.RemoteAddr().String())
-	}
-	statusNetwork := strings.Join(connInfo.NetworksUsed, "+")
-	statusMode := "P2P"
-	if connInfo.RelayUsed {
-		statusMode = "Relay"
-	}
-	ReportP2PStatus(ncconfig, topicSalt, "connected", statusNetwork, statusMode, connInfo.PeerAddress)
-	preOnClose := nconn.OnClose
-	nconn.OnClose = func() {
-		ReportP2PStatus(ncconfig, topicSalt, "disconnected", statusNetwork, statusMode, connInfo.PeerAddress)
-		if preOnClose != nil {
-			preOnClose()
-		}
-	}
-	nconn.MQTTHelloCtrlPayload = helloPayload.CtrlString()
-	nconn.MQTTHelloAppPayload = helloPayload.AppString()
-	return nconn, nil
+	return secure.DoNegotiation(&config, conn, ncconfig.LogWriter)
 }
 
 func do_P2P_multipath(ncconfig *AppNetcatConfig, enableMP bool) (*secure.NegotiatedConn, error) {

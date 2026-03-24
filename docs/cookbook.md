@@ -140,7 +140,7 @@ gonc -e ":s5s -b -u -http -auth user:simplekey123" -k -l 1080
 
 ```
 
-如果把SOCKS5运行在公网，建议使用TLS+PSK的加密认证，不过其他应用客户端就不支持直接接入了，需要本地再开一个gonc协助加密转发（只支持TCP），不支持SOCKS5代理UDP。
+如果把SOCKS5运行在公网，建议使用TLS+PSK的加密认证，不过其他应用客户端就不支持直接接入了，需要本地再开一个gonc协助加密转发。
 <div class="interactive-box">
   <label>🛠️设置示例server-ip:</label>
   <input type="text" placeholder="server-ip" value="server-ip" oninput="updateServerIP(this)">
@@ -157,7 +157,7 @@ gonc -e ":s5s -b -u -http -auth user:simplekey123" -k -l 1080
 
     ```bash
     # 类似SSH，应用客户端通过1080接入代理服务器
-    gonc -e ":nc -tls -psk mysecret123 server-ip 3080" -k -l 1080
+    gonc -e ":s5c -tls -psk mysecret123 server-ip 3080" -k -l 1080
     ```
 
 === "客户端（BIND加密反向代理）"

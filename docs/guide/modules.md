@@ -110,8 +110,8 @@ gonc -tls -psk simplekey123 -e ":s5s -b" -k -l 8443
 === "本地标准SOCKS5"
 
     ```bash
-    # 客户端调用:nc建立加密TCP连接。不支持代理UDP
-    gonc -e ":nc -tls -psk simplekey123 server-ip 8443" -k -l 127.0.0.1 1080
+    # 客户端调用:s5c建立加密TCP连接。同时支持加密代理UDP
+    gonc -e ":s5c -tls -psk simplekey123 server-ip 8443" -k -l 127.0.0.1 1080
 
     ```
 
@@ -284,7 +284,7 @@ Link 字符串定义了隧道两端的行为，格式为分号分隔的 **双端
 
 #### **(2) 转发协议 (`f://`)**
 
-端口转发模式 (Port Forwarding)。监听一端的端口，将流量转发到另一端可达的目标地址。
+端口转发模式 (Port Forwarding)。支持TCP/UDP，监听一端的端口，将流量转发到另一端可达的目标地址。
 
 **语法格式**：
 `f://ip:port?to=target:port&[params]`
@@ -298,6 +298,8 @@ Link 字符串定义了隧道两端的行为，格式为分号分隔的 **双端
 | 参数 | 示例 | 说明 |
 | --- | --- | --- |
 | **`outbound_bind`** | `outbound_bind=10.0.0.5` | 指定连接目标地址时使用的源 IP。 |
+| **`proto`** | `proto=udp` 或 `proto=all` | 不指定proto参数时默认仅开启TCP端口，proto=udp表示仅UDP转发。 |
+
 
 #### **(3) TLS 加密扩展 (`+tls`)**
 

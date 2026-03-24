@@ -197,9 +197,9 @@ README in [English](./README.md) 、 [中文](./README_zh.md)
 
     `gonc.exe -tls -psk randomString -e :s5s -keep-open -acl acl.txt -P -l 1080`
 
-     另一端使用:nc把socks5 over tls转为标准socks5，在本地127.0.0.1:3080提供本地客户端接入
+     另一端使用:s5c把socks5 over tls转为标准socks5，在本地127.0.0.1:3080提供本地客户端接入
 
-    `gonc.exe -e ":nc -tls -psk randomString x.x.x.x 1080" -keep-open -l -local 127.0.0.1:3080`
+    `gonc.exe -e ":s5c -tls -psk randomString x.x.x.x 1080" -keep-open -l -local 127.0.0.1:3080`
 
 ### 多服务监听模式
 - 参考SSH的22端口，既可提供shell也提供sftp和端口转发功能，gonc使用 -e ":service" 也可监听在一个服务端口，基于tls+psk安全认证提供shell、socks5(支持CONNECNT+BIND)和文件服务。（请务必使用gonc -psk .生成高熵PSK替换randomString）
@@ -212,7 +212,7 @@ README in [English](./README.md) 、 [中文](./README_zh.md)
 
     另一端把socks5 over tls转为本地标准socks5端口1080
 
-    `gonc -e ":nc -tls -psk randomString -call :s5s <server-ip> 2222" -k -P -l -local 127.0.0.1:1080`
+    `gonc -e ":s5c -tls -psk randomString -call :s5s <server-ip> 2222" -k -P -l -local 127.0.0.1:1080`
 
     另一端把文件服务为本地标准HTTP端口8000
 
