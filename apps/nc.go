@@ -43,7 +43,9 @@ type AppNetcatConfig struct {
 	LogWriter                  io.Writer
 	goroutineConnectionCounter int32
 
-	ctx                          context.Context
+	Ctx                          context.Context
+	GlobalCtx                    context.Context
+	Callback_OnSessionReady      func()
 	callback_OnConnectionDestroy func(localAddrStr, remoteAddrStr string)
 
 	network, host, port, p2pSessionKey string
@@ -160,7 +162,7 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	config := &AppNetcatConfig{
 		LogWriter: swriter,
 		Logger:    log.New(swriter, "", 0),
-		ctx:       context.Background(),
+		Ctx:       context.Background(),
 	}
 
 	// 创建一个自定义的 FlagSet，而不是使用全局的 flag.CommandLine
@@ -846,11 +848,20 @@ func runP2PMode(console net.Conn, ncconfig *AppNetcatConfig) int {
 
 	if ncconfig.keepOpen {
 		for {
+			if ncconfig.GlobalCtx != nil {
+				select {
+				case <-ncconfig.GlobalCtx.Done():
+					return 0
+				default:
+				}
+			}
 			nconn, err := do_P2P_multipath(ncconfig, ncconfig.useMutilPath)
 			if err != nil {
-				ncconfig.Logger.Printf("P2P failed: %v\n", err)
-				ncconfig.Logger.Printf("Will retry in 10 seconds...\n")
-				time.Sleep(10 * time.Second)
+				fmt.Fprintf(ncconfig.LogWriter, "P2P failed: %v\n", err)
+				fmt.Fprintf(ncconfig.LogWriter, "Will retry in 10 seconds...\n")
+				if !waitWithGlobalContext(ncconfig, 10*time.Second) {
+					return 0
+				}
 				continue
 			}
 
@@ -865,7 +876,9 @@ func runP2PMode(console net.Conn, ncconfig *AppNetcatConfig) int {
 				handleP2PConnection(console, ncconfig, nconn, stats_in, stats_out)
 				ncconfig.Logger.Printf("Disconnected from: %s\n", addr)
 			}
-			time.Sleep(2 * time.Second)
+			if !waitWithGlobalContext(ncconfig, 2*time.Second) {
+				return 0
+			}
 		}
 	} else {
 		nconn, err := do_P2P_multipath(ncconfig, ncconfig.useMutilPath)
@@ -874,6 +887,20 @@ func runP2PMode(console net.Conn, ncconfig *AppNetcatConfig) int {
 			return 1
 		}
 		return handleP2PConnection(console, ncconfig, nconn, stats_in, stats_out)
+	}
+}
+
+func waitWithGlobalContext(ncconfig *AppNetcatConfig, d time.Duration) bool {
+	if ncconfig == nil || ncconfig.GlobalCtx == nil {
+		time.Sleep(d)
+		return true
+	}
+
+	select {
+	case <-time.After(d):
+		return true
+	case <-ncconfig.GlobalCtx.Done():
+		return false
 	}
 }
 
@@ -1437,7 +1464,7 @@ func runKCPBridge(console net.Conn, ncconfig *AppNetcatConfig) int {
 		ncconfig.keepAlive = TCP_timeout
 	}
 
-	ctx, cancel := context.WithCancel(ncconfig.ctx)
+	ctx, cancel := context.WithCancel(ncconfig.Ctx)
 	defer cancel()
 	done := make(chan int, 2)
 
@@ -1448,7 +1475,7 @@ func runKCPBridge(console net.Conn, ncconfig *AppNetcatConfig) int {
 		//nc2. runP2PMode -e ":br -u -framed local port1" -plain -tls -mqtt-wait -framed -framed-tcp
 		var err error
 		nc1 := *ncconfig
-		nc1.ctx = ctx
+		nc1.Ctx = ctx
 		//nc1.runCmd 一样
 		nc1.listenMode = true
 		nc1.p2pSessionKey = ""
@@ -1486,7 +1513,7 @@ func runKCPBridge(console net.Conn, ncconfig *AppNetcatConfig) int {
 		time.Sleep(1 * time.Second)
 
 		nc2 := *ncconfig
-		nc2.ctx = ctx
+		nc2.Ctx = ctx
 		nc2.listenMode = false
 		nc2.kcpBridgeMode = false
 		nc2.featureModulesRun = nil
@@ -1521,7 +1548,7 @@ func runKCPBridge(console net.Conn, ncconfig *AppNetcatConfig) int {
 
 		var err error
 		nc2 := *ncconfig
-		nc2.ctx = ctx
+		nc2.Ctx = ctx
 		nc2.kcpBridgeMode = false
 		nc2.featureModulesRun = nil
 		nc2.runCmd = fmt.Sprintf(":br -p2p \"%s\" -mqtt-hello -keepalive %d -framed -framed-tcp -plain",
@@ -2012,6 +2039,7 @@ func copyCharDeviceWithProgress(ncconfig *AppNetcatConfig, dst io.Writer, src io
 func preinitNegotiationConfig(ncconfig *AppNetcatConfig) *secure.NegotiationConfig {
 	config := secure.NewNegotiationConfig()
 
+	config.Context = ncconfig.Ctx
 	config.InsecureSkipVerify = !ncconfig.tlsVerifyCert
 	config.KeepAlive = ncconfig.keepAlive
 
@@ -2093,6 +2121,9 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 		stats_in.ResetStart()
 		stats_out.ResetStart()
 		ncconfig.sessionReady = true
+		if ncconfig.Callback_OnSessionReady != nil {
+			ncconfig.Callback_OnSessionReady()
+		}
 	}
 
 	// 默认使用标准输入输出
@@ -2605,7 +2636,7 @@ func Mqtt_ensure_ready(ncconfig *AppNetcatConfig) (string, error) {
 
 	if ncconfig.useMQTTWait {
 		ReportP2PStatus(ncconfig, "", "wait", ncconfig.network, "", "")
-		salt, err = easyp2p.MqttWait(ncconfig.ctx, ncconfig.p2pSessionKey, ncconfig.localbindIP, 30*time.Minute, ncconfig.LogWriter)
+		salt, err = easyp2p.MqttWait(ncconfig.Ctx, ncconfig.p2pSessionKey, ncconfig.localbindIP, 30*time.Minute, ncconfig.LogWriter)
 		if err != nil {
 			return "", fmt.Errorf("mqtt-wait: %v", err)
 		}
@@ -2613,7 +2644,7 @@ func Mqtt_ensure_ready(ncconfig *AppNetcatConfig) (string, error) {
 
 	if ncconfig.useMQTTHello {
 		ReportP2PStatus(ncconfig, "", "wait", ncconfig.network, "", "")
-		salt, err = easyp2p.MQTTHello(ncconfig.ctx, ncconfig.p2pSessionKey, ncconfig.localbindIP, ncconfig.MQTTHelloPayload, 15*time.Second, ncconfig.LogWriter)
+		salt, err = easyp2p.MQTTHello(ncconfig.Ctx, ncconfig.p2pSessionKey, ncconfig.localbindIP, ncconfig.MQTTHelloPayload, 15*time.Second, ncconfig.LogWriter)
 		if err != nil {
 			return "", fmt.Errorf("mqtt-hello: %v", err)
 		}
@@ -2678,7 +2709,7 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 	}
 
 	//sessionKey+topicSalt组合成和对端单独共享的mqtt topic
-	connInfo, err := easyp2p.Easy_P2P_MP(ncconfig.ctx, ncconfig.network, ncconfig.localbind, ncconfig.p2pSessionKey+topicSalt, false, relayConn, ncconfig.LogWriter)
+	connInfo, err := easyp2p.Easy_P2P_MP(ncconfig.Ctx, ncconfig.network, ncconfig.localbind, ncconfig.p2pSessionKey+topicSalt, false, relayConn, ncconfig.LogWriter)
 	if err != nil {
 		if relayConn != nil {
 			relayConn.Close()
