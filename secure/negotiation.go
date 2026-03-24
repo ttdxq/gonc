@@ -19,6 +19,7 @@ import (
 )
 
 type NegotiationConfig struct {
+	Context                   context.Context
 	Label                     string
 	IsClient                  bool
 	SecureLayer               string //tls tls13 dtls ss
@@ -141,12 +142,27 @@ func (nconn *NegotiatedConn) SetWriteDeadline(t time.Time) error {
 }
 
 func DoNegotiation(cfg *NegotiationConfig, rawconn net.Conn, logWriter io.Writer) (*NegotiatedConn, error) {
+	parentCtx := cfg.Context
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+
+	stopCancelClose := make(chan struct{})
+	defer close(stopCancelClose)
+
 	nconn := &NegotiatedConn{
 		Config:     cfg,
 		ConnLayers: []net.Conn{rawconn},
 	}
 	var connStack []string
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(parentCtx)
+	go func() {
+		select {
+		case <-ctx.Done():
+			rawconn.Close()
+		case <-stopCancelClose:
+		}
+	}()
 	defer func() {
 		if nconn.cancel == nil {
 			cancel()
@@ -417,12 +433,23 @@ func doDTLS(ctx context.Context, config *NegotiationConfig, conn net.Conn, store
 	firstRefusedLogged := false
 	for {
 		if err = dtlsConn.HandshakeContext(ctx); err != nil {
+			if ctx.Err() != nil {
+				fmt.Fprintf(logWriter, "failed: %v\n", ctx.Err())
+				dtlsConn.Close()
+				return nil, ctx.Err()
+			}
 			if netx.IsConnRefused(err) {
 				if !firstRefusedLogged {
 					fmt.Fprintf(logWriter, "ECONNREFUSED during handshake\n")
 					firstRefusedLogged = true
 				}
-				time.Sleep(500 * time.Millisecond)
+				select {
+				case <-time.After(500 * time.Millisecond):
+				case <-ctx.Done():
+					fmt.Fprintf(logWriter, "failed: %v\n", ctx.Err())
+					dtlsConn.Close()
+					return nil, ctx.Err()
+				}
 				continue
 			}
 			dtlsConn.Close()

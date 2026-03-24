@@ -1798,8 +1798,27 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 		return committed
 	}
 
+	waitWithContext := func(d time.Duration) bool {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(d):
+			return true
+		}
+	}
+
 	//打洞有时候有多个连接都打洞成功了，通过doHandshake实现双向确认，共同选择同一条连接，其他关闭
 	doHandshake := func(conn net.Conn, isClient bool, tag string) error {
+		stopClose := make(chan struct{})
+		defer close(stopClose)
+		go func() {
+			select {
+			case <-ctx.Done():
+				conn.Close()
+			case <-stopClose:
+			}
+		}()
+
 		var success bool
 		buf := make([]byte, len(punchAckPayload))
 		if isClient {
@@ -2000,7 +2019,9 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 			if !inSameLAN {
 				if isClient {
 					//easy - easy 失败，可能对方的洞口没开是不可以先碰的
-					time.Sleep(3 * time.Second)
+					if !waitWithContext(3 * time.Second) {
+						return
+					}
 					randomDstPort = true
 				} else {
 					randomSrcPort = true
@@ -2066,6 +2087,8 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 							select {
 							case <-done:
 								// tryConnect 提前完成了，不等待了
+							case <-ctx.Done():
+								return
 							case <-time.After(1500 * time.Millisecond):
 								// 超时了，还没结束，那我们继续
 							}
@@ -2090,8 +2113,10 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 
 	go doAccept()
 	// Delay for passive side
-	if !isClient && !p2pInfo.LANProbeOnly {
-		time.Sleep(2 * time.Second)
+	if !isClient {
+		if !waitWithContext(2 * time.Second) {
+			return nil, false, nil, context.Canceled
+		}
 	}
 	go doPunching()
 
@@ -2105,6 +2130,8 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 		return conn, isClient, sharedKey, nil
 	case errCh := <-errChan:
 		return nil, false, nil, fmt.Errorf("P2P TCP hole punching failed: %s", errCh.Error())
+	case <-ctx.Done():
+		return nil, false, nil, ctx.Err()
 	case <-time.After(time.Duration(timeoutMax) * time.Second):
 		return nil, false, nil, fmt.Errorf("P2P TCP hole punching failed: Timeout")
 	}
