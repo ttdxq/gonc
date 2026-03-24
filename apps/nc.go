@@ -2781,7 +2781,7 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 	if ncconfig.useLAN {
 		// ─── LAN 模式分支 ───
 		transportPref := easyp2p.LANTransportFromConfig(ncconfig.udpProtocol)
-		connInfo, err = easyp2p.Easy_P2P_LAN(ncconfig.ctx, ncconfig.p2pSessionKey+topicSalt, transportPref, 90*time.Second, ncconfig.LogWriter)
+		connInfo, err = easyp2p.Easy_P2P_LAN(ncconfig.Ctx, ncconfig.p2pSessionKey+topicSalt, transportPref, 90*time.Second, ncconfig.LogWriter)
 		if err != nil {
 			ReportP2PStatus(ncconfig, topicSalt, fmt.Sprintf("error:%v", err), ncconfig.network, "", "")
 			return nil, err
@@ -2803,7 +2803,7 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 		}
 
 		//sessionKey+topicSalt组合成和对端单独共享的mqtt topic
-		connInfo, err = easyp2p.Easy_P2P_MP(ncconfig.ctx, ncconfig.network, ncconfig.localbind, ncconfig.p2pSessionKey+topicSalt, false, relayConn, ncconfig.LogWriter)
+		connInfo, err = easyp2p.Easy_P2P_MP(ncconfig.Ctx, ncconfig.network, ncconfig.localbind, ncconfig.p2pSessionKey+topicSalt, false, relayConn, ncconfig.LogWriter)
 		if err != nil {
 			if relayConn != nil {
 				relayConn.Close()
