@@ -46,6 +46,7 @@ type AppNetcatConfig struct {
 	Ctx                          context.Context
 	GlobalCtx                    context.Context
 	Callback_OnSessionReady      func()
+	Callback_RegisterShutdown    func(closeFunc func()) func()
 	callback_OnConnectionDestroy func(localAddrStr, remoteAddrStr string)
 
 	network, host, port, p2pSessionKey string
@@ -927,15 +928,26 @@ func runP2PMode(console net.Conn, ncconfig *AppNetcatConfig) int {
 				continue
 			}
 
+			var unregisterShutdown func()
+			if ncconfig.Callback_RegisterShutdown != nil {
+				unregisterShutdown = ncconfig.Callback_RegisterShutdown(func() { nconn.Close() })
+			}
+
 			if ncconfig.useMQTTWait {
-				go func(c *secure.NegotiatedConn) {
+				go func(c *secure.NegotiatedConn, unregister func()) {
+					if unregister != nil {
+						defer unregister()
+					}
 					addr := c.RemoteAddr().String()
 					handleP2PConnection(console, ncconfig, c, stats_in, stats_out)
 					ncconfig.Logger.Printf("Disconnected from: %s\n", addr)
-				}(nconn)
+				}(nconn, unregisterShutdown)
 			} else {
 				addr := nconn.RemoteAddr().String()
 				handleP2PConnection(console, ncconfig, nconn, stats_in, stats_out)
+				if unregisterShutdown != nil {
+					unregisterShutdown()
+				}
 				ncconfig.Logger.Printf("Disconnected from: %s\n", addr)
 			}
 			if !waitWithGlobalContext(ncconfig, 2*time.Second) {
@@ -947,6 +959,12 @@ func runP2PMode(console net.Conn, ncconfig *AppNetcatConfig) int {
 		if err != nil {
 			ncconfig.Logger.Printf("P2P failed: %v\n", err)
 			return 1
+		}
+		if ncconfig.Callback_RegisterShutdown != nil {
+			unregisterShutdown := ncconfig.Callback_RegisterShutdown(func() { nconn.Close() })
+			if unregisterShutdown != nil {
+				defer unregisterShutdown()
+			}
 		}
 		return handleP2PConnection(console, ncconfig, nconn, stats_in, stats_out)
 	}
