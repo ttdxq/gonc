@@ -34,7 +34,7 @@ import (
 )
 
 var (
-	VERSION = "v2.4.13"
+	VERSION = "v2.5.1"
 )
 
 type AppNetcatConfig struct {
@@ -264,7 +264,7 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	fs.BoolVar(&config.httpdownload, "http-download", false, "<localDir> <urlPath>; download from gonc's (-httplocal-port) HTTP service")
 
 	//<----- Global flags
-	fs.StringVar(&config.stunSrv, "stunsrv", strings.Join(easyp2p.STUNServers, ","), "STUN server list, comma-separated (e.g. stun1,stun2) or '@<file>' with one server per line")
+	fs.StringVar(&config.stunSrv, "stunsrv", strings.Join(easyp2p.STUNServers, ","), "STUN server list, comma-separated (e.g. stun1,stun2) or '@<file>' or 'URL<http:// or https://>' with one server per line")
 	fs.StringVar(&config.mqttServers, "mqttsrv", strings.Join(easyp2p.MQTTBrokerServers, ","), "MQTT servers")
 	fs.StringVar(&MagicDNServer, "magicdns", MagicDNServer, "MagicDNServer")
 	disableCompress := fs.Bool("no-compress", false, "disable compression for http download")
@@ -445,6 +445,7 @@ func App_Netcat_main(console *misc.ConsoleIO, args []string) int {
 	}
 	config.ConsoleMode = true
 	misc.EnableVirtualTerminal()
+	ensureSignalHandler()
 
 	return App_Netcat_main_withconfig(console, config)
 }
@@ -506,13 +507,43 @@ func firstInit(ncconfig *AppNetcatConfig) {
 	easyp2p.MQTTBrokerServers = parseMultiItems(ncconfig.mqttServers, true)
 
 	if ncconfig.stunSrv != "" {
-		if strings.HasPrefix(ncconfig.stunSrv, "@") {
+		if strings.HasPrefix(ncconfig.stunSrv, "http://") || strings.HasPrefix(ncconfig.stunSrv, "https://") {
+			// 支持通过 URL 获取配置，设置 10 秒超时避免阻塞初始化
+			client := &http.Client{Timeout: 10 * time.Second}
+			resp, err := client.Get(ncconfig.stunSrv)
+			if err != nil {
+				ncconfig.Logger.Printf("fetch stun server list from URL failed: %v\n", err)
+				os.Exit(1)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				ncconfig.Logger.Printf("fetch stun server list returned bad status: %s\n", resp.Status)
+				os.Exit(1)
+			}
+
+			data, err := io.ReadAll(resp.Body)
+			if err != nil {
+				ncconfig.Logger.Printf("read stun server response body failed: %v\n", err)
+				os.Exit(1)
+			}
+
+			// 兼容处理 Windows (\r\n) 和 Linux (\n) 的换行符
+			cleanData := strings.ReplaceAll(string(data), "\r\n", "\n")
+			lines := strings.Split(cleanData, "\n")
+			ncconfig.stunSrv = strings.Join(lines, ",")
+
+		} else if strings.HasPrefix(ncconfig.stunSrv, "@") {
+			// 原有的本地文件读取逻辑
 			data, err := os.ReadFile(strings.TrimPrefix(ncconfig.stunSrv, "@"))
 			if err != nil {
 				ncconfig.Logger.Printf("read stun server file failed: %v\n", err)
 				os.Exit(1)
 			}
-			lines := strings.Split(string(data), "\n")
+
+			// 同样兼容一下换行符
+			cleanData := strings.ReplaceAll(string(data), "\r\n", "\n")
+			lines := strings.Split(cleanData, "\n")
 			ncconfig.stunSrv = strings.Join(lines, ",")
 		}
 	}
@@ -724,7 +755,7 @@ func configureSecurity(ncconfig *AppNetcatConfig) error {
 			panic(err)
 		}
 		fmt.Fprintf(os.Stdout, "%s\n", ncconfig.presharedKey)
-		os.Exit(1)
+		os.Exit(0)
 	}
 	if ncconfig.presharedKey != "" {
 		if strings.HasPrefix(ncconfig.presharedKey, "@") {
@@ -1459,8 +1490,20 @@ func runHTTPDownload(console net.Conn, ncconfig *AppNetcatConfig) int {
 }
 
 func runNATChecker(console net.Conn, ncconfig *AppNetcatConfig) int {
-
-	networksToTryStun := []string{"tcp6", "tcp4", "udp6", "udp4"}
+	network := "any"
+	if ncconfig.udpProtocol {
+		network = "udp"
+	}
+	if ncconfig.useIPv4 {
+		network += "4"
+	} else if ncconfig.useIPv6 {
+		network += "6"
+	}
+	networksToTryStun, err := easyp2p.NetworksForStun(network)
+	if err != nil {
+		ncconfig.Logger.Printf("failed: %v\n", err)
+		return 1
+	}
 
 	ncconfig.Logger.Printf("STUN Results (Local -> NAT -> STUNServer)\n")
 	ncconfig.Logger.Printf("-----------\n")
@@ -2561,6 +2604,7 @@ func handleConnection(console net.Conn, ncconfig *AppNetcatConfig, cfg *secure.N
 	nconn, err := secure.DoNegotiation(cfg, conn, ncconfig.LogWriter)
 	if err != nil {
 		conn.Close()
+		fmt.Fprintf(ncconfig.LogWriter, "%sError: %v\n", cfg.Label, err)
 		return 1
 	}
 
@@ -2829,6 +2873,9 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 			ReportP2PStatus(ncconfig, topicSalt, fmt.Sprintf("error:%v", err), ncconfig.network, "", "")
 			return nil, err
 		}
+		if !connInfo.RelayUsed && relayConn != nil {
+			relayConn.Close()
+		}
 	}
 
 	rawconn := connInfo.Conns[0]
@@ -2855,7 +2902,7 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 	}
 	statusNetwork := strings.Join(connInfo.NetworksUsed, "+")
 	statusMode := "P2P"
-	if connInfo.RelayUsed {
+	if connInfo.RelayMode {
 		statusMode = "Relay"
 	}
 	ReportP2PStatus(ncconfig, topicSalt, "connected", statusNetwork, statusMode, connInfo.PeerAddress)

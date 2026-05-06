@@ -365,6 +365,8 @@ func doTLS(ctx context.Context, config *NegotiationConfig, conn net.Conn, storeK
 		return nil, err
 	}
 
+	fmt.Fprintf(logWriter, "%sTLS handshake completed successfully\n", config.Label)
+
 	if storeKeyingMaterial != nil {
 		state := conn_tls.ConnectionState()
 		label := "EXPERIMENTAL-SERVER-KEY"
@@ -457,6 +459,9 @@ func doDTLS(ctx context.Context, config *NegotiationConfig, conn net.Conn, store
 		}
 		break
 	}
+
+	fmt.Fprintf(logWriter, "%sDTLS handshake completed successfully\n", config.Label)
+
 	conn.SetDeadline(time.Time{}) // 取消握手超时
 
 	if storeKeyingMaterial != nil {
@@ -578,6 +583,8 @@ func doKCP(ctx context.Context, config *NegotiationConfig, conn net.Conn, timeou
 		sess.Close()
 		return nil, fmt.Errorf("failed to receive handshake(HELLO): %w", err)
 	}
+
+	fmt.Fprintf(logWriter, "%sKCP handshake completed successfully\n", config.Label)
 
 	// 取消超时（恢复成无超时）
 	sess.SetReadDeadline(time.Time{})
