@@ -41,17 +41,20 @@ type PortOwner struct {
 }
 
 type AppMuxConfig struct {
-	Logger           *log.Logger
-	Engine           string
-	AppMode          string
-	Port             string   // listen port
-	LinkLocalConf    string   // for mux link L config
-	LinkRemoteConf   string   // for mux link R config
-	HttpServerVDirs  []string // for httpserver
-	HttpClientDir    string   // for httpclient
-	DownloadPath     string
-	AccessCtrl       *acl.ACL
-	KeepAliveTimeout int
+	Logger                  *log.Logger
+	Engine                  string
+	AppMode                 string
+	Port                    string   // listen port
+	LinkLocalConf           string   // for mux link L config
+	LinkRemoteConf          string   // for mux link R config
+	HttpServerVDirs         []string // for httpserver
+	HttpFileSource          httpfileshare.FileSource
+	HttpClientDir           string // for httpclient
+	DownloadPath            string
+	AccessCtrl              *acl.ACL
+	KeepAliveTimeout        int
+	LinkAgentUpstreamConfig *ProxyClientConfig // for linkagent tunnel upstream
+	LinkAgentDNSForward     string             // for linkagent DNS UDP→TCP interception (host:port)
 }
 
 type MuxSessionConfig struct {
@@ -185,7 +188,7 @@ func bidirectionalCopy(local io.ReadWriteCloser, stream io.ReadWriteCloser) {
 func App_mux_usage(logWriter io.Writer) {
 	fmt.Fprintln(logWriter, "Usage:")
 	fmt.Fprintln(logWriter, "   :mux socks5")
-	fmt.Fprintln(logWriter, "   :mux linkagent")
+	fmt.Fprintln(logWriter, "   :mux linkagent [-x <socks5-proxy>] [-dns <dns-server[:port]>]")
 	fmt.Fprintln(logWriter, "   :mux link <L-Config>;<R-Config> (e.g. mux link x://127.0.0.1:8000;none)")
 	fmt.Fprintln(logWriter, "   :mux httpserver <rootDir1> <rootDir2>... (serve multiple dirs with virtual paths)")
 	fmt.Fprintln(logWriter, "   :mux httpclient <saveDir> <remotePath>")
@@ -215,10 +218,40 @@ func AppMuxConfigByArgs(logWriter io.Writer, args []string) (*AppMuxConfig, erro
 		config.Port = args[1]
 
 	case "linkagent":
-		if len(args) != 1 {
-			return nil, fmt.Errorf("usage: :mux linkagent")
-		}
 		config.AppMode = "linkagent"
+		for i := 1; i < len(args); i++ {
+			switch args[i] {
+			case "-x":
+				if i+1 >= len(args) {
+					return nil, fmt.Errorf("usage: :mux linkagent [-x <socks5-proxy>]")
+				}
+				xArg := args[i+1]
+				var upstreamCfg *ProxyClientConfig
+				var parseErr error
+				if IsProxyURLFormat(xArg) {
+					upstreamCfg, parseErr = ParseProxyURL(logWriter, xArg)
+				} else {
+					upstreamCfg, parseErr = ProxyClientConfigByCommandline(logWriter, "socks5", "", xArg)
+				}
+				if parseErr != nil {
+					return nil, fmt.Errorf("linkagent -x: %w", parseErr)
+				}
+				config.LinkAgentUpstreamConfig = upstreamCfg
+				i++
+			case "-dns":
+				if i+1 >= len(args) {
+					return nil, fmt.Errorf("usage: :mux linkagent [-dns <dns-server[:port]>]")
+				}
+				dnsAddr := args[i+1]
+				if !strings.Contains(dnsAddr, ":") {
+					dnsAddr = dnsAddr + ":53"
+				}
+				config.LinkAgentDNSForward = dnsAddr
+				i++
+			default:
+				return nil, fmt.Errorf("unknown argument for linkagent: %s", args[i])
+			}
+		}
 
 	case "link":
 		// mux link L,R or L;R
@@ -309,9 +342,25 @@ func App_mux_main_withconfig(conn net.Conn, config *AppMuxConfig) {
 	}
 
 	err := handleMuxSession(&cfg)
-	if err != nil {
+	if err != nil && !isExpectedMuxClose(err) {
 		config.Logger.Printf(":mux: %v\n", err)
 	}
+}
+
+func isExpectedMuxClose(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isExpectedNetClose(err) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "mux session closed") ||
+		strings.Contains(msg, "link session closed") ||
+		strings.Contains(msg, "linkagent session closed") ||
+		strings.Contains(msg, "forward session closed") ||
+		strings.Contains(msg, "session shutdown") ||
+		strings.Contains(msg, "session closed")
 }
 
 func handleMuxSession(cfg *MuxSessionConfig) error {
@@ -418,6 +467,7 @@ type linkRuntimeConfig struct {
 	TargetPort          int
 	ForwardTarget       string
 	ForwardProto        string // "tcp"(默认), "udp", "all"
+	ProxyProto          string // "" 关闭；"v2" 在 stream OK 后注入 PROXY v2 头给对端透传到目标业务
 }
 
 // setupLinkRuntimeConfig 负责在 Accept 之前完成所有配置分析、TLS加载和参数校验
@@ -449,6 +499,18 @@ func setupLinkRuntimeConfig(muxcfg *MuxSessionConfig, scheme string, params url.
 			return nil, fmt.Errorf("failed to load/generate TLS certificate: %v", err)
 		}
 		cfg.NtConfig.Certs = []tls.Certificate{*cert}
+	}
+
+	// 通用参数：PROXY protocol 注入开关。仅支持 "v2"
+	if pp := params.Get("pp"); pp != "" {
+		if pp != "v2" {
+			return nil, fmt.Errorf("invalid pp value '%s', only 'v2' is supported", pp)
+		}
+		if scheme == "raw" {
+			muxcfg.Logger.Printf("[link] pp=v2 has no effect on raw scheme, ignored")
+		} else {
+			cfg.ProxyProto = pp
+		}
 	}
 
 	// 2. Scheme 特定配置分析
@@ -532,7 +594,7 @@ func runLinkListener(muxcfg *MuxSessionConfig, session interface{}, ln net.Liste
 	// 如果是纯 UDP 模式，不需要 TCP accept 循环
 	if scheme == "f" && rtConfig.ForwardProto == "udp" {
 		<-doneChan
-		return fmt.Errorf("forward session closed")
+		return nil
 	}
 
 	// 启动 UDP 透明代理（与 TCP 监听并行）
@@ -560,7 +622,9 @@ func runLinkListener(muxcfg *MuxSessionConfig, session interface{}, ln net.Liste
 
 		stream, err := openMuxStream(session)
 		if err != nil {
-			muxcfg.Logger.Println("mux Open failed:", err)
+			if !isExpectedMuxClose(err) {
+				muxcfg.Logger.Println("mux Open failed:", err)
+			}
 			return
 		}
 		streamWithCloseWrite := newStreamWrapper(stream, muxSessionRemoteAddr(session), muxSessionLocalAddr(session))
@@ -589,15 +653,26 @@ func runLinkListener(muxcfg *MuxSessionConfig, session interface{}, ln net.Liste
 			}
 		}
 
-		ServeProxyOnTunnel(&s5config, c, keyingMaterial, streamWithCloseWrite, cmd, tHost, tPort)
+		var proxyHeader []byte
+		if rtConfig.ProxyProto == "v2" {
+			proxyHeader = BuildProxyV2HeaderFromConns(c)
+			if proxyHeader == nil {
+				muxcfg.Logger.Printf("[link] pp=v2: skip header (non-TCP addr): %s -> %s", c.RemoteAddr(), c.LocalAddr())
+			}
+		}
+
+		ServeProxyOnTunnel(&s5config, c, keyingMaterial, streamWithCloseWrite, cmd, tHost, tPort, proxyHeader)
 	}
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			if isExpectedMuxClose(err) {
+				return nil
+			}
 			select {
 			case <-doneChan:
-				return fmt.Errorf("mux session closed")
+				return nil
 			default:
 				return fmt.Errorf("listener accept failed: %v", err)
 			}
@@ -628,6 +703,11 @@ func runLinkSessionWithHandshake(cfg *MuxSessionConfig, lConf string, rConf stri
 	if err != nil {
 		return fmt.Errorf("local config parse error: %v", err)
 	}
+	// 同时解析 R-Config（用来知道对端 listener 是否启用 pp=v2）
+	_, _, rParams, err := parseLinkConfig(rConf)
+	if err != nil {
+		return fmt.Errorf("remote config parse error: %v", err)
+	}
 
 	localActive := "0"
 	if lScheme != "none" {
@@ -641,6 +721,11 @@ func runLinkSessionWithHandshake(cfg *MuxSessionConfig, lConf string, rConf stri
 	}
 	sendConf += fmt.Sprintf("%speer_active=%s", separator, localActive)
 	separator = "&"
+
+	// 若本端（L）开了 pp=v2，需告知对端"我会发 PROXY v2 头"，对端作为 dialer 才会读
+	if lParams.Get("pp") == "v2" {
+		sendConf += fmt.Sprintf("%speer_pp=v2", separator)
+	}
 
 	if !strings.HasPrefix(rConf, "none") {
 		// 追加 owner 参数
@@ -668,6 +753,14 @@ func runLinkSessionWithHandshake(cfg *MuxSessionConfig, lConf string, rConf stri
 	}
 	cfg.Logger.Printf("[link] Remote ready (%s).", ack)
 
+	// 解析 ACK 中的 caps（兼容老版本 R：没有 caps 字段即视为空集合）
+	caps := parseAckCaps(ack)
+
+	// 任一侧配置了 pp=v2，对端必须支持 pp_v2 能力位，否则握手失败
+	if (lParams.Get("pp") == "v2" || rParams.Get("pp") == "v2") && !caps["pp_v2"] {
+		return fmt.Errorf("remote does not support pp_v2 capability (ACK=%q). please upgrade the peer", ack)
+	}
+
 	cfg.SessionConn.SetDeadline(time.Time{})
 
 	session, err := createMuxSession(cfg.Engine, cfg.SessionConn, true)
@@ -676,9 +769,11 @@ func runLinkSessionWithHandshake(cfg *MuxSessionConfig, lConf string, rConf stri
 	}
 
 	remoteActive := !strings.HasPrefix(rConf, "none")
+	// 作为 dialer，是否要从 stream 读 PROXY v2 头取决于"对端 listener 是否启用了 pp=v2"
+	expectPP := rParams.Get("pp") == "v2"
 	sessionDone := make(chan struct{})
 	go func() {
-		startRemoteStreamAcceptLoop(cfg, session, lParams.Get("outbound_bind"), !remoteActive)
+		startRemoteStreamAcceptLoop(cfg, session, lParams.Get("outbound_bind"), !remoteActive, expectPP, nil)
 		close(sessionDone)
 	}()
 
@@ -700,7 +795,7 @@ func runLinkSessionWithHandshake(cfg *MuxSessionConfig, lConf string, rConf stri
 	}
 
 	<-sessionDone
-	return fmt.Errorf("link session closed")
+	return nil
 }
 
 // handleLinkMode (Local)
@@ -770,10 +865,10 @@ func handleListenMode(cfg *MuxSessionConfig, notifyAddrChan chan<- string, done 
 		return err
 	}
 
-	// 单向模式：drainOnly = true
+	// 单向模式：drainOnly = true；legacy 流程不支持 pp=v2
 	sessionDone := make(chan struct{})
 	go func() {
-		startRemoteStreamAcceptLoop(cfg, session, "", true)
+		startRemoteStreamAcceptLoop(cfg, session, "", true, false, nil)
 		close(sessionDone)
 	}()
 
@@ -929,9 +1024,9 @@ func handleLinkAgentMode(cfg *MuxSessionConfig) error {
 			}
 		}()
 
-		ackMsg = fmt.Sprintf("OK:%s", actualAddr)
+		ackMsg = fmt.Sprintf("OK:%s;%s", actualAddr, buildAckCaps())
 	} else {
-		ackMsg = "OK:none"
+		ackMsg = "OK:none;" + buildAckCaps()
 	}
 
 	session, err := createMuxSession(cfg.Engine, cfg.SessionConn, false)
@@ -952,9 +1047,12 @@ func handleLinkAgentMode(cfg *MuxSessionConfig) error {
 
 	cfg.Logger.Printf("[linkagent] Session established. OwnerID=%s", rParams.Get("owner"))
 
+	// 作为 dialer，是否要从 stream 读 PROXY v2 头取决于对端（L）listener 是否启用 pp=v2，
+	// 这个信息由 L 通过 rConf 中的 peer_pp=v2 字段传过来。
+	expectPP := rParams.Get("peer_pp") == "v2"
 	sessionDone := make(chan struct{})
 	go func() {
-		startRemoteStreamAcceptLoop(cfg, session, rParams.Get("outbound_bind"), !peerActive)
+		startRemoteStreamAcceptLoop(cfg, session, rParams.Get("outbound_bind"), !peerActive, expectPP, cfg.LinkAgentUpstreamConfig)
 		close(sessionDone)
 	}()
 
@@ -963,7 +1061,7 @@ func handleLinkAgentMode(cfg *MuxSessionConfig) error {
 	}
 
 	<-sessionDone
-	return fmt.Errorf("linkagent session closed")
+	return nil
 }
 
 // -----------------------------------------------------------------------------
@@ -992,7 +1090,7 @@ func handleHTTPClientMode(cfg *MuxSessionConfig) error {
 			Resume:                 true,
 			DryRun:                 false,
 			Verbose:                false,
-			LogLevel:               httpfileshare.LogLevelError,
+			LogLevel:               httpfileshare.LogLevelRepair,
 			LoggerOutput:           cfg.Logger.Writer(),
 			ProgressOutput:         cfg.Logger.Writer(),
 			ProgressUpdateInterval: 1 * time.Second,
@@ -1014,11 +1112,16 @@ func handleHTTPClientMode(cfg *MuxSessionConfig) error {
 }
 
 // startRemoteStreamAcceptLoop 从 mux session 接受流并处理 SOCKS5 请求
-func startRemoteStreamAcceptLoop(cfg *MuxSessionConfig, session interface{}, localbind string, drainOnly bool) error {
+// expectProxyHeader：握手期协商出"对端是 listener 且开启了 pp=v2"则为 true，
+// 此时每条 stream 在 OK 之后会先收到一个完整的 PROXY v2 头部，本侧需消费并透传到 target。
+func startRemoteStreamAcceptLoop(cfg *MuxSessionConfig, session interface{}, localbind string, drainOnly bool, expectProxyHeader bool, upstreamConfig *ProxyClientConfig) error {
 	listener := newMuxListener(session)
 	s5config := Socks5uConfig{
-		Logger:     cfg.Logger,
-		AccessCtrl: cfg.AccessCtrl,
+		Logger:               cfg.Logger,
+		AccessCtrl:           cfg.AccessCtrl,
+		ExpectProxyHeader:    expectProxyHeader,
+		TunnelUpstreamConfig: upstreamConfig,
+		DNSForwardAddr:       cfg.LinkAgentDNSForward,
 	}
 	if localbind != "" {
 		s5config.Localbind = strings.Split(localbind, ",")
@@ -1026,7 +1129,7 @@ func startRemoteStreamAcceptLoop(cfg *MuxSessionConfig, session interface{}, loc
 	for {
 		stream, err := listener.Accept()
 		if err != nil {
-			if err == io.EOF {
+			if isExpectedMuxClose(err) {
 				return nil
 			}
 			return err
@@ -1107,7 +1210,7 @@ func handleSocks5uMode(cfg *MuxSessionConfig) error {
 	}
 
 	cfg.Logger.Printf("[socks5] tunnel server ready on mux session(%s).", cfg.SessionConn.RemoteAddr().String())
-	err = startRemoteStreamAcceptLoop(cfg, session, "", false)
+	err = startRemoteStreamAcceptLoop(cfg, session, "", false, false, nil)
 	cfg.Logger.Printf("[socks5] finished(%s).", cfg.SessionConn.RemoteAddr().String())
 	return err
 }
@@ -1127,6 +1230,7 @@ func handleHTTPServerMode(cfg *MuxSessionConfig) error {
 
 	srvcfg := httpfileshare.ServerConfig{
 		RootPaths:    cfg.HttpServerVDirs,
+		FileSource:   cfg.HttpFileSource,
 		LoggerOutput: cfg.Logger.Writer(),
 		EnableZstd:   enableZstd,
 		Listener:     ln,
@@ -1140,6 +1244,33 @@ func handleHTTPServerMode(cfg *MuxSessionConfig) error {
 	cfg.Logger.Println("httpserver ready on mux")
 
 	return server.Start()
+}
+
+// supportedCaps 本进程对外宣告的能力位（写进 R 端的 ACK）。新增能力时追加到这里即可。
+var supportedCaps = []string{"pp_v2"}
+
+// buildAckCaps 返回形如 "caps=pp_v2,xxx" 的片段。
+func buildAckCaps() string {
+	return "caps=" + strings.Join(supportedCaps, ",")
+}
+
+// parseAckCaps 从 ACK 中解析 caps。ACK 形如 "OK:<addr>;caps=pp_v2,xxx"。
+// 老版本 ACK 没有 caps 段，返回空集合。
+func parseAckCaps(ack string) map[string]bool {
+	out := make(map[string]bool)
+	for _, seg := range strings.Split(ack, ";") {
+		seg = strings.TrimSpace(seg)
+		if !strings.HasPrefix(seg, "caps=") {
+			continue
+		}
+		for _, c := range strings.Split(seg[len("caps="):], ",") {
+			c = strings.TrimSpace(c)
+			if c != "" {
+				out[c] = true
+			}
+		}
+	}
+	return out
 }
 
 func sendHello(conn net.Conn, mode string) error {

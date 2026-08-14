@@ -69,6 +69,12 @@
 
 * `-http`: 开启兼容HTTP代理协议，这样同时能支持HTTP代理的客户端了。
 
+* `-x <proxy-chain>`: 为 `:s5s` 的出站 TCP CONNECT 请求指定上游代理链。格式与全局 `-x` 的 URL 形式一致，例如 `socks5://host:port`、`socks5s://host:port?psk=key`、`https://host:port`，多个代理用逗号连接。
+
+  启用后，SOCKS5 CONNECT 和 HTTP CONNECT 的目标地址会原样交给上游代理，由上游代理服务器解析 DNS；本机不会对目标地址做出站 ACL 检查。`-local` 此时只用于绑定连接第一跳上游代理时使用的本地源 IP。
+
+  注意：`:s5s -x` 只支持 TCP CONNECT。SOCKS5 UDP ASSOCIATE、SOCKS5 BIND，以及普通 HTTP 请求（GET/POST 等非 CONNECT）会被明确拒绝。
+
 * `-local`: 限定使用的出站源 IP，如果服务器有多个 IP，可指定多个，用 **逗号分隔**。  
   **支持顺序优先**，即列表靠前的 IP 优先尝试路由连通性。 例如：
 
@@ -89,6 +95,11 @@
 ```bash
 # 启动一个监听在 1080 的 SOCKS5 代理服务器，带认证
 gonc -k -e ":s5s -auth user:simplekey123" -l 1080 
+```
+
+```bash
+# 启动本地代理入口，所有 TCP CONNECT 通过上游加密 SOCKS5 代理链转发
+gonc -k -e ":s5s -x 'socks5s://1.2.3.4:3080?psk=key1,socks5s://2.3.4.5:3080?psk=key2'" -l 1080
 ```
 
 **高级组合 (Socks5 over TLS)**：
@@ -281,6 +292,7 @@ Link 字符串定义了隧道两端的行为，格式为分号分隔的 **双端
 | **`tproxy`** | `tproxy=1` | 启用透明代理支持 (Linux TProxy)。 |
 | **`allow`** | `allow=domain` | 使透明代理允许代理访问域名。 |
 | **`outbound_bind`** | `outbound_bind=10.0.0.5` | **指定出口 IP**。当对端机器有多个 IP 时，强制代理流量从指定网卡发出。 |
+| **`pp`** | `pp=v2` | **PROXY protocol v2 透传**。挂在监听侧。本端为每个接入客户端在隧道里附带一个 PROXY v2 头（HAProxy 标准），由对端 gonc **原样写到目标连接**，目标业务（nginx/HAProxy/自研服务）即可拿到真实客户端 IP。对端 gonc 同时会读出头部用于审计日志。需要两端都为支持该参数的版本——否则握手期立即报错。目标业务侧必须配合启用 PROXY listener（如 nginx `listen ... proxy_protocol;`）。 |
 
 #### **(2) 转发协议 (`f://`)**
 
@@ -300,6 +312,7 @@ Link 字符串定义了隧道两端的行为，格式为分号分隔的 **双端
 | --- | --- | --- |
 | **`outbound_bind`** | `outbound_bind=10.0.0.5` | 指定连接目标地址时使用的源 IP。 |
 | **`proto`** | `proto=udp` 或 `proto=all` | 不指定proto参数时默认仅开启TCP端口，proto=udp表示仅UDP转发。 |
+| **`pp`** | `pp=v2` | **PROXY protocol v2 透传**（仅 TCP）。让目标业务通过标准 PROXY 协议拿到真实客户端 IP。详见 `x://` 中同名参数说明。 |
 
 
 #### **(3) TLS 加密扩展 (`+tls`)**
@@ -361,6 +374,22 @@ gonc -p2p mysecret123 -link "x://0.0.0.0:1080?tproxy=1;none?outbound_bind=192.16
 ```bash
 gonc -p2p mysecret123 -link "none;f://0.0.0.0:8080?to=192.168.0.1:80"
 ```
+
+=== "反向代理 + 让目标业务看到真实客户端 IP（PROXY v2）"
+在上面反向代理基础上加 `pp=v2`，公司侧接入的客户端真实 `IP:Port` 会通过 HAProxy PROXY 协议 v2 头部由隧道透传到家里目标业务，家里 nginx/业务服务可拿到真实 IP；家里 gonc 日志同步打印源信息便于审计。
+```bash
+gonc -p2p mysecret123 -link "none;f://0.0.0.0:8080?to=192.168.0.1:80&pp=v2"
+```
+**目标业务侧必须启用 PROXY listener**，例如 nginx：
+```nginx
+server {
+    listen 80 proxy_protocol;
+    set_real_ip_from 127.0.0.1;
+    real_ip_header proxy_protocol;
+    # 之后 $remote_addr 即真实客户端 IP
+}
+```
+需要两端 gonc 都为支持该参数的版本，否则握手期会立即报错。
 
 === "TLS 安全监听"
 本地监听加密的 SOCKS5 端口（需要客户端用 TLS 连入）。

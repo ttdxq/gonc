@@ -18,6 +18,12 @@ README in [English](./README.md) 、 [中文](./README_zh.md)
 
 ---
 
+## 相关项目
+
+- [gonc-gui](https://github.com/threatexpert/gonc-gui) —— 基于 `gonc` 的桌面（Windows）和 Android 应用：提供便捷的跨设备、跨网络点对点直连与安全文件传输。只需分享口令（或扫码），无需命令行。
+
+---
+
 ## 使用示例
 
 ### 基本用法
@@ -265,7 +271,7 @@ README in [English](./README.md) 、 [中文](./README_zh.md)
     "tcp://turn.cloudflare.com:80",
     "udp://turn.cloudflare.com:53",
     "udp://stun.l.google.com:19302",
-    "udp://stun.miwifi.com:3478",
+    "stun.gonc.cc:3478",
     "global.turn.twilio.com:3478",
     "stun.nextcloud.com:443",
 

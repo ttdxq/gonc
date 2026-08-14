@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -24,6 +25,7 @@ import (
 
 	//_ "net/http/pprof"
 
+	"github.com/mdp/qrterminal/v3"
 	"github.com/threatexpert/gonc/v2/acl"
 	"github.com/threatexpert/gonc/v2/easyp2p"
 	"github.com/threatexpert/gonc/v2/httpfileshare"
@@ -34,13 +36,14 @@ import (
 )
 
 var (
-	VERSION = "v2.5.1"
+	VERSION = "v2.6.9"
 )
 
 type AppNetcatConfig struct {
 	ConsoleMode                bool
 	Logger                     *log.Logger
 	LogWriter                  io.Writer
+	ProgressSink               func(ProgressSnapshot)
 	goroutineConnectionCounter int32
 
 	Ctx                          context.Context
@@ -78,81 +81,192 @@ type AppNetcatConfig struct {
 	accessControl *acl.ACL
 	term_oldstat  *term.State
 
-	proxyProt         string
-	proxyAddr         string
-	proxyAddr2        string
-	auth              string
-	sendfile          string
-	sendsize          int64
-	writefile         string
-	tlsEnabled        bool
-	tlsServerMode     bool
-	tls10_forced      bool
-	tls11_forced      bool
-	tls12_forced      bool
-	tls13_forced      bool
-	tlsECCertEnabled  bool
-	tlsRSACertEnabled bool
-	tlsSNI            string
-	sslCertFile       string
-	sslKeyFile        string
-	presharedKey      string
-	autoPSK           bool
-	shadowStream      bool
-	enableCRLF        bool
-	listenMode        bool
-	udpProtocol       bool
-	useUNIXdomain     bool
-	kcpEnabled        bool
-	kcpSEnabled       bool
-	localbind         string
-	localbindIP       string
-	remoteAddr        string
-	progressEnabled   bool
-	runCmd            string
-	remoteCall        string
-	keepOpen          bool
-	enablePty         bool
-	useSTUN           bool
-	stunSrv           string
-	mqttServers       string
-	autoP2P           string
-	useMutilPath      bool
-	useMQTTWait       bool
-	useMQTTHello      bool
-	useLAN            bool
-	MQTTHelloPayload  easyp2p.HelloPayload
-	useIPv4           bool
-	useIPv6           bool
-	useDNS            string
-	runAppFileServ    string
-	runAppFileGet     string
-	downloadSubPath   string
-	appMuxListenMode  bool
-	appMuxListenOn    string
-	appMuxSocksMode   bool
-	appMuxLinkAgent   bool
-	runAppLink        string
-	fileACL           string
-	plainTransport    bool
-	framedStdio       bool
-	framedTCP         bool
-	p2pReportURL      string
-	featureModulesRun []string
-	Args              []string
-	natchecker        bool
-	httpdownload      bool
-	portRotate        bool
-	kcpBridgeMode     bool
-	verbose           bool
-	verboseWithTime   bool
-	muxEnabled        bool
-	muxLocalPort      string
-	muxLocalListener  net.Listener
-	dialreadTimeout   int
-	scanOnly          bool
-	daemon            bool
-	outputLogFile     string
+	proxyProt            string
+	proxyAddr            string
+	proxyAddr2           string
+	auth                 string
+	sendfile             string
+	sendsize             int64
+	speedTestDuration    time.Duration
+	writefile            string
+	tlsEnabled           bool
+	tlsServerMode        bool
+	tls10_forced         bool
+	tls11_forced         bool
+	tls12_forced         bool
+	tls13_forced         bool
+	tlsECCertEnabled     bool
+	tlsRSACertEnabled    bool
+	tlsSNI               string
+	sslCertFile          string
+	sslKeyFile           string
+	presharedKey         string
+	showQRCode           bool
+	autoPSK              bool
+	shadowStream         bool
+	enableCRLF           bool
+	listenMode           bool
+	proxyProtocolEnabled bool
+	udpProtocol          bool
+	useUNIXdomain        bool
+	kcpEnabled           bool
+	kcpSEnabled          bool
+	localbind            string
+	localbindIP          string
+	remoteAddr           string
+	progressEnabled      bool
+	runCmd               string
+	remoteCall           string
+	keepOpen             bool
+	enablePty            bool
+	useSTUN              bool
+	stunSrv              string
+	mqttServers          string
+	autoP2P              string
+	useMutilPath         bool
+	useMQTTWait          bool
+	useMQTTHello         bool
+	useLAN               bool
+	useLANPassive        bool
+	p2pWithLanMode       bool
+	MQTTHelloPayload     easyp2p.HelloPayload
+	useIPv4              bool
+	useIPv6              bool
+	useDNS               string
+	runAppFileServ       string
+	runAppFileGet        string
+	downloadSubPath      string
+	appMuxListenMode     bool
+	appMuxListenOn       string
+	appMuxSocksMode      bool
+	appMuxLinkAgent      bool
+	runAppLink           string
+	fileACL              string
+	plainTransport       bool
+	framedStdio          bool
+	framedTCP            bool
+	p2pReportURL         string
+	featureModulesRun    []string
+	Args                 []string
+	natchecker           bool
+	httpdownload         bool
+	portRotate           bool
+	kcpBridgeMode        bool
+	verbose              bool
+	verboseWithTime      bool
+	muxEnabled           bool
+	muxLocalPort         string
+	muxLocalListener     net.Listener
+	dialreadTimeout      int
+	scanOnly             bool
+	daemon               bool
+	outputLogFile        string
+}
+
+type ProgressSnapshot struct {
+	InBytes   int64
+	OutBytes  int64
+	InBps     float64
+	OutBps    float64
+	Elapsed   int
+	ConnCount int
+	Final     bool
+}
+
+type AppExitError struct {
+	Code int
+	Err  error
+}
+
+func (e *AppExitError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Err != nil {
+		return e.Err.Error()
+	}
+	return fmt.Sprintf("exit code %d", e.Code)
+}
+
+func (e *AppExitError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func AppExitCode(err error) (int, bool) {
+	var exitErr *AppExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.Code, true
+	}
+	return 0, false
+}
+
+func parseBinarySize(value string) (int64, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, fmt.Errorf("size cannot be empty")
+	}
+
+	digitEnd := 0
+	for digitEnd < len(value) && value[digitEnd] >= '0' && value[digitEnd] <= '9' {
+		digitEnd++
+	}
+	if digitEnd == 0 {
+		return 0, fmt.Errorf("invalid size %q", value)
+	}
+
+	units := map[string]uint64{
+		"":    1,
+		"B":   1,
+		"K":   1 << 10,
+		"KB":  1 << 10,
+		"KIB": 1 << 10,
+		"M":   1 << 20,
+		"MB":  1 << 20,
+		"MIB": 1 << 20,
+		"G":   1 << 30,
+		"GB":  1 << 30,
+		"GIB": 1 << 30,
+		"T":   1 << 40,
+		"TB":  1 << 40,
+		"TIB": 1 << 40,
+	}
+	multiplier, ok := units[strings.ToUpper(value[digitEnd:])]
+	if !ok {
+		return 0, fmt.Errorf("invalid size unit in %q", value)
+	}
+
+	amount, err := strconv.ParseUint(value[:digitEnd], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid size %q: %w", value, err)
+	}
+	const maxInt64 = uint64(^uint64(0) >> 1)
+	if amount > maxInt64/multiplier {
+		return 0, fmt.Errorf("size %q overflows int64", value)
+	}
+	return int64(amount * multiplier), nil
+}
+
+type binarySizeValue struct {
+	target *int64
+}
+
+func (v binarySizeValue) String() string {
+	if v.target == nil {
+		return "0"
+	}
+	return strconv.FormatInt(*v.target, 10)
+}
+
+func (v binarySizeValue) Set(value string) error {
+	size, err := parseBinarySize(value)
+	if err != nil {
+		return err
+	}
+	*v.target = size
+	return nil
 }
 
 // AppNetcatConfigByArgs 解析给定的 []string 参数，生成 AppNetcatConfig
@@ -182,7 +296,8 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	fs.StringVar(&config.proxyAddr2, "x2", "", "Proxy address (same format as -x). Only used if P2P connection fails.")
 	fs.StringVar(&config.auth, "auth", "", "user:password for proxy")
 	fs.StringVar(&config.sendfile, "send", "", "path to file to send (optional)")
-	fs.Int64Var(&config.sendsize, "sendsize", 0, "size of file to send (optional, default is full file size)")
+	fs.Var(binarySizeValue{target: &config.sendsize}, "sendsize", "size of file to send; supports binary units such as 100M or 1GiB")
+	fs.DurationVar(&config.speedTestDuration, "speedtest", 0, "run throughput test for a duration such as 10s, 5m, or 1h (0 disables speed test)")
 	fs.StringVar(&config.writefile, "write", "", "write to file")
 	fs.BoolVar(&config.tlsEnabled, "tls", false, "Enable TLS connection")
 	fs.BoolVar(&config.tlsServerMode, "tlsserver", false, "force as TLS server while connecting")
@@ -196,10 +311,12 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	fs.StringVar(&config.sslCertFile, "ssl-cert", "", "Specify SSL certificate file (PEM) for listening")
 	fs.StringVar(&config.sslKeyFile, "ssl-key", "", "Specify SSL private key (PEM) for listening")
 	fs.StringVar(&config.presharedKey, "psk", "", "Pre-shared key for deriving TLS certificate identity (anti-MITM) and for TCP/KCP encryption; when using -p2p, the P2P session key overrides this value.")
+	fs.BoolVar(&config.showQRCode, "qr", false, "print a terminal QR code for -p2p passphrase or generated -psk .")
 	fs.BoolVar(&config.autoPSK, "auto-psk", false, "Use MQTT/ECDHE to automatically derive shared encryption key")
 	fs.BoolVar(&config.shadowStream, "ss", false, "TLS-free, lightweight, low-signature encrypted transport in P2P mode")
 	fs.BoolVar(&config.enableCRLF, "C", false, "enable CRLF")
 	fs.BoolVar(&config.listenMode, "l", false, "listen mode")
+	fs.BoolVar(&config.proxyProtocolEnabled, "pp", false, "accept and strip PROXY protocol v1/v2 header on each accepted connection (strict). c.RemoteAddr()/LocalAddr() and ACL will see the real client address.")
 	fs.BoolVar(&config.udpProtocol, "u", false, "use UDP protocol")
 	fs.BoolVar(&config.useUNIXdomain, "U", false, "Specifies to use UNIX-domain sockets.")
 	fs.BoolVar(&config.kcpEnabled, "kcp", false, "use UDP+KCP protocol, -u can be omitted")
@@ -220,6 +337,8 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	fs.BoolVar(&config.useMQTTHello, "mqtt-hello", false, "send MQTT hello message before initiating P2P connection")
 	fs.BoolVar(&config.useMQTTHello, "H", false, "alias for -mqtt-hello")
 	fs.BoolVar(&config.useLAN, "lan", false, "use LAN broadcast discovery instead of STUN/MQTT for P2P (can combine with -W/-H)")
+	fs.BoolVar(&config.useLANPassive, "lan-passive", false, "low-frequency LAN discovery mode for long-running responders (implies -lan)")
+	fs.BoolVar(&config.p2pWithLanMode, "p2p-with-lan", false, "run normal P2P and LAN discovery concurrently")
 	fs.BoolVar(&config.useIPv4, "4", false, "Forces to use IPv4 addresses only")
 	fs.BoolVar(&config.useIPv6, "6", false, "Forces to use IPv4 addresses only")
 	fs.StringVar(&config.useDNS, "dns", "", "set DNS Server")
@@ -294,6 +413,18 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	if err != nil {
 		return nil, err // 解析错误直接返回
 	}
+	if config.speedTestDuration < 0 {
+		return nil, fmt.Errorf("-speedtest cannot be negative")
+	}
+	if config.speedTestDuration > 0 {
+		config.progressEnabled = true
+		if config.sendfile == "" {
+			config.sendfile = "/dev/urandom"
+		}
+		if config.writefile == "" {
+			config.writefile = "/dev/null"
+		}
+	}
 	config.Args = fs.Args()
 	if config.verbose {
 		if config.verboseWithTime || config.keepOpen || isAppModeRequiredKeepOpen(config) || strings.HasPrefix(argv0, ":") {
@@ -306,46 +437,42 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 		}
 	}
 
-	if config.daemon {
-		if err := daemonize(config); err != nil {
-			// daemonize may call os.Exit on success; error means we failed to start background process
-			fmt.Fprintf(logWriter, "Failed to daemonize: %v\n", err)
-			os.Exit(1)
-		}
-	}
-
 	if config.outputLogFile != "" {
 		logFile, err := os.OpenFile(config.outputLogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 		if err != nil {
-			fmt.Fprintf(logWriter, "Failed to open log file %s: %v\n", config.outputLogFile, err)
-			os.Exit(1)
+			return nil, fmt.Errorf("failed to open log file %s: %w", config.outputLogFile, err)
 		}
 		swriter.SetOutput(logFile)
 	}
 
 	// 1. 初始化基本设置
-	firstInit(config)
+	if err := firstInit(config); err != nil {
+		return nil, err
+	}
 
-	// 2. 配置内置应用程序模式（例如http服务器，socks5）
-	configureAppMode(config)
-
-	// 3. 配置安全功能，如PSK和ACL
+	// 2. 配置安全功能，如PSK和ACL
 	err = configureSecurity(config)
 	if err != nil {
-		fmt.Fprintf(logWriter, "Security configuration failed: %v\n", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("security configuration failed: %w", err)
+	}
+
+	// 3. 配置内置应用程序模式（例如http服务器，socks5）
+	if err := configureAppMode(config); err != nil {
+		return nil, err
+	}
+	if conflictCheck(config) != 0 {
+		return nil, fmt.Errorf("conflicting options")
 	}
 
 	if fs.NFlag() == 0 && fs.NArg() == 0 {
 		usage_less(logWriter, argv0)
-		os.Exit(1)
+		return nil, &AppExitError{Code: 1}
 	}
 
 	// 4. 从参数和标志确定网络类型、地址和P2P会话密钥
 	network, host, port, P2PSessionKey, err := determineNetworkAndAddress(config)
 	if err != nil && len(config.featureModulesRun) == 0 {
-		fmt.Fprintf(logWriter, "Error determining network address: %v\n", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("error determining network address: %w", err)
 	}
 
 	config.network = network
@@ -363,7 +490,10 @@ func AppNetcatConfigByArgs(logWriter io.Writer, argv0 string, args []string) (*A
 	}
 	configureDNS(config)
 	swriter.Enable(config.verbose)
-	config.connConfig = preinitNegotiationConfig(config)
+	config.connConfig, err = preinitNegotiationConfig(config)
+	if err != nil {
+		return nil, err
+	}
 	return config, nil
 }
 
@@ -435,17 +565,26 @@ func reorderNetcatArgs(args []string) []string {
 }
 
 func App_Netcat_main(console *misc.ConsoleIO, args []string) int {
+	misc.EnableVirtualTerminal()
 	config, err := AppNetcatConfigByArgs(os.Stderr, "gonc", args)
 	if err != nil {
-		if err == flag.ErrHelp {
+		if code, ok := AppExitCode(err); ok {
+			return code
+		}
+		if errors.Is(err, flag.ErrHelp) {
 			return 1
 		}
 		fmt.Fprintf(os.Stderr, "Error parsing gonc args: %v\n", err)
 		return 1
 	}
 	config.ConsoleMode = true
-	misc.EnableVirtualTerminal()
 	ensureSignalHandler()
+	if config.daemon {
+		if err := daemonize(config); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to daemonize: %v\n", err)
+			return 1
+		}
+	}
 
 	return App_Netcat_main_withconfig(console, config)
 }
@@ -487,6 +626,16 @@ func App_Netcat_main_withconfig(console net.Conn, config *AppNetcatConfig) int {
 	}
 
 	if config.p2pSessionKey != "" {
+		if config.p2pWithLanMode {
+			if config.useMQTTWait {
+				if !config.keepOpen {
+					config.Logger.Printf("Passive P2P with LAN mode requires -keep-open\n")
+					return 1
+				}
+				return runP2PAndLanPassiveMode(console, config)
+			}
+			return runP2PAndLanActiveMode(console, config)
+		}
 		return runP2PMode(console, config)
 	} else {
 		if config.listenMode {
@@ -503,7 +652,7 @@ func App_Netcat_main_withconfig(console net.Conn, config *AppNetcatConfig) int {
 	}
 }
 
-func firstInit(ncconfig *AppNetcatConfig) {
+func firstInit(ncconfig *AppNetcatConfig) error {
 	easyp2p.MQTTBrokerServers = parseMultiItems(ncconfig.mqttServers, true)
 
 	if ncconfig.stunSrv != "" {
@@ -512,20 +661,17 @@ func firstInit(ncconfig *AppNetcatConfig) {
 			client := &http.Client{Timeout: 10 * time.Second}
 			resp, err := client.Get(ncconfig.stunSrv)
 			if err != nil {
-				ncconfig.Logger.Printf("fetch stun server list from URL failed: %v\n", err)
-				os.Exit(1)
+				return fmt.Errorf("fetch stun server list from URL failed: %w", err)
 			}
 			defer resp.Body.Close()
 
 			if resp.StatusCode != http.StatusOK {
-				ncconfig.Logger.Printf("fetch stun server list returned bad status: %s\n", resp.Status)
-				os.Exit(1)
+				return fmt.Errorf("fetch stun server list returned bad status: %s", resp.Status)
 			}
 
 			data, err := io.ReadAll(resp.Body)
 			if err != nil {
-				ncconfig.Logger.Printf("read stun server response body failed: %v\n", err)
-				os.Exit(1)
+				return fmt.Errorf("read stun server response body failed: %w", err)
 			}
 
 			// 兼容处理 Windows (\r\n) 和 Linux (\n) 的换行符
@@ -537,8 +683,7 @@ func firstInit(ncconfig *AppNetcatConfig) {
 			// 原有的本地文件读取逻辑
 			data, err := os.ReadFile(strings.TrimPrefix(ncconfig.stunSrv, "@"))
 			if err != nil {
-				ncconfig.Logger.Printf("read stun server file failed: %v\n", err)
-				os.Exit(1)
+				return fmt.Errorf("read stun server file failed: %w", err)
 			}
 
 			// 同样兼容一下换行符
@@ -549,9 +694,7 @@ func firstInit(ncconfig *AppNetcatConfig) {
 	}
 
 	easyp2p.STUNServers = parseMultiItems(ncconfig.stunSrv, true)
-	if conflictCheck(ncconfig) != 0 {
-		os.Exit(1)
-	}
+	return nil
 }
 
 func isEnabledMuxMode(ncconfig *AppNetcatConfig) bool {
@@ -576,7 +719,7 @@ func isAppModeRequiredKeepOpen(ncconfig *AppNetcatConfig) bool {
 }
 
 // configureAppMode 为内置应用程序设置命令参数
-func configureAppMode(ncconfig *AppNetcatConfig) {
+func configureAppMode(ncconfig *AppNetcatConfig) error {
 	userSpecifiedRunCmd := ncconfig.runCmd != ""
 	appMode := false
 	if ncconfig.runAppFileServ != "" {
@@ -643,7 +786,7 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 	if appMode && userSpecifiedRunCmd {
 		// appMode（-linkagent等） 需要替换runCmd， 如果本来用户配置了-e，则有冲突
 		ncconfig.Logger.Printf("Error: App modes (-httpserver, -linkagent, etc.) cannot be used with -e \n")
-		os.Exit(1)
+		return fmt.Errorf("app modes (-httpserver, -linkagent, etc.) cannot be used with -e")
 	}
 
 	if ncconfig.portRotate {
@@ -656,12 +799,12 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 			ncconfig.runCmd = ":service"
 		} else {
 			ncconfig.Logger.Printf("-portrate and -e \":mux ...\"(socks5server/httpserver/linkagent) must be used together\n")
-			os.Exit(1)
+			return fmt.Errorf("-portrate and -e \":mux ...\"(socks5server/httpserver/linkagent) must be used together")
 		}
 	} else if ncconfig.kcpBridgeMode {
 		if !strings.HasPrefix(ncconfig.runCmd, ":mux ") {
 			ncconfig.Logger.Printf("-kcpbr and -e \":mux ...\"(socks5server/httpserver/linkagent) must be used together\n")
-			os.Exit(1)
+			return fmt.Errorf("-kcpbr and -e \":mux ...\"(socks5server/httpserver/linkagent) must be used together")
 		}
 	}
 
@@ -695,7 +838,7 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 		if err != flag.ErrHelp {
 			ncconfig.Logger.Printf("%v\n", err)
 		}
-		os.Exit(1)
+		return err
 	}
 
 	xcommandline := ncconfig.proxyAddr
@@ -712,7 +855,7 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 				xconfig, err := ParseProxyURL(ncconfig.LogWriter, parts[0])
 				if err != nil {
 					ncconfig.Logger.Printf("Error parse proxy URL: %v\n", err)
-					os.Exit(1)
+					return fmt.Errorf("error parse proxy URL: %w", err)
 				}
 				ncconfig.arg_proxyc_Config = xconfig
 			} else {
@@ -720,7 +863,7 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 				chainClient, err := ParseProxyChainURL(ncconfig.LogWriter, xcommandline)
 				if err != nil {
 					ncconfig.Logger.Printf("Error parse proxy chain: %v\n", err)
-					os.Exit(1)
+					return fmt.Errorf("error parse proxy chain: %w", err)
 				}
 				ncconfig.arg_proxyc_Client = chainClient
 			}
@@ -731,7 +874,10 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 				if err != flag.ErrHelp {
 					ncconfig.Logger.Printf("Error init proxy config: %v\n", err)
 				}
-				os.Exit(1)
+				if errors.Is(err, flag.ErrHelp) {
+					return err
+				}
+				return fmt.Errorf("error init proxy config: %w", err)
 			}
 			ncconfig.arg_proxyc_Config = xconfig
 		}
@@ -745,6 +891,25 @@ func configureAppMode(ncconfig *AppNetcatConfig) {
 	if ncconfig.kcpBridgeMode {
 		ncconfig.featureModulesRun = append(ncconfig.featureModulesRun, "kcp-bridge")
 	}
+	return nil
+}
+
+func printPassphraseQRCode(w io.Writer, title, passphrase string) {
+	if strings.TrimSpace(passphrase) == "" {
+		return
+	}
+	fmt.Fprintln(w)
+	if title != "" {
+		fmt.Fprintln(w, title)
+	}
+	qrterminal.GenerateWithConfig(passphrase, qrterminal.Config{
+		Level:     qrterminal.L,
+		Writer:    w,
+		BlackChar: qrterminal.BLACK,
+		WhiteChar: qrterminal.WHITE,
+		QuietZone: 2,
+	})
+	fmt.Fprintf(w, "Passphrase: %s\n\n", passphrase)
 }
 
 func configureSecurity(ncconfig *AppNetcatConfig) error {
@@ -752,17 +917,19 @@ func configureSecurity(ncconfig *AppNetcatConfig) error {
 	if ncconfig.presharedKey == "." {
 		ncconfig.presharedKey, err = secure.GenerateSecureRandomString(22)
 		if err != nil {
-			panic(err)
+			return fmt.Errorf("generate PSK failed: %w", err)
+		}
+		if ncconfig.showQRCode {
+			printPassphraseQRCode(os.Stderr, "Generated passphrase QR:", ncconfig.presharedKey)
 		}
 		fmt.Fprintf(os.Stdout, "%s\n", ncconfig.presharedKey)
-		os.Exit(0)
+		return &AppExitError{Code: 0}
 	}
 	if ncconfig.presharedKey != "" {
 		if strings.HasPrefix(ncconfig.presharedKey, "@") {
 			ncconfig.presharedKey, err = secure.ReadPSKFile(ncconfig.presharedKey)
 			if err != nil {
-				ncconfig.Logger.Printf("Error reading PSK file: %v\n", err)
-				os.Exit(1)
+				return fmt.Errorf("error reading PSK file: %w", err)
 			}
 		}
 	}
@@ -831,6 +998,9 @@ func determineNetworkAndAddress(ncconfig *AppNetcatConfig) (network, host, port,
 		} else if ncconfig.autoP2P != "" {
 			ncconfig.listenMode = false
 			P2PSessionKey = ncconfig.autoP2P
+			if ncconfig.useLANPassive {
+				ncconfig.useLAN = true
+			}
 			if ncconfig.useLAN {
 				if ncconfig.udpProtocol {
 					network = "udp4"
@@ -851,18 +1021,20 @@ func determineNetworkAndAddress(ncconfig *AppNetcatConfig) (network, host, port,
 			if strings.HasPrefix(P2PSessionKey, "@") {
 				P2PSessionKey, err = secure.ReadPSKFile(P2PSessionKey)
 				if err != nil {
-					ncconfig.Logger.Printf("Error reading PSK file: %v\n", err)
-					os.Exit(1)
+					return network, "", "", "", fmt.Errorf("error reading PSK file: %w", err)
 				}
 			}
 			if P2PSessionKey == "." {
 				P2PSessionKey, err = secure.GenerateSecureRandomString(22)
 				if err != nil {
-					panic(err)
+					return network, "", "", "", fmt.Errorf("generate P2P session key failed: %w", err)
 				}
 				ncconfig.Logger.Printf("Keep this key secret! It is used to establish the secure P2P tunnel: %s\n", P2PSessionKey)
 			} else if secure.IsWeakPassword(P2PSessionKey) {
 				return network, "", "", "", fmt.Errorf("weak password detected")
+			}
+			if ncconfig.showQRCode {
+				printPassphraseQRCode(ncconfig.LogWriter, "P2P passphrase QR:", P2PSessionKey)
 			}
 			if !ncconfig.plainTransport {
 				//没-plain的情况，P2P默认启用kcp tls
@@ -942,6 +1114,13 @@ func runP2PMode(console net.Conn, ncconfig *AppNetcatConfig) int {
 
 	if ncconfig.keepOpen {
 		for {
+			select {
+			case <-ncconfig.Ctx.Done():
+				ncconfig.Logger.Printf("P2P stopped\n")
+				return 0
+			default:
+			}
+
 			if ncconfig.GlobalCtx != nil {
 				select {
 				case <-ncconfig.GlobalCtx.Done():
@@ -951,6 +1130,10 @@ func runP2PMode(console net.Conn, ncconfig *AppNetcatConfig) int {
 			}
 			nconn, err := do_P2P_multipath(ncconfig, ncconfig.useMutilPath)
 			if err != nil {
+				if ncconfig.Ctx.Err() != nil || (ncconfig.GlobalCtx != nil && ncconfig.GlobalCtx.Err() != nil) {
+					ncconfig.Logger.Printf("P2P stopped\n")
+					return 0
+				}
 				fmt.Fprintf(ncconfig.LogWriter, "P2P failed: %v\n", err)
 				fmt.Fprintf(ncconfig.LogWriter, "Will retry in 10 seconds...\n")
 				if !waitWithGlobalContext(ncconfig, 10*time.Second) {
@@ -960,11 +1143,9 @@ func runP2PMode(console net.Conn, ncconfig *AppNetcatConfig) int {
 			}
 
 			var unregisterShutdown func()
-			if ncconfig.Callback_RegisterShutdown != nil {
-				unregisterShutdown = ncconfig.Callback_RegisterShutdown(func() { nconn.Close() })
-			}
+			unregisterShutdown = registerP2PConnectionShutdown(ncconfig, nconn)
 
-			if ncconfig.useMQTTWait {
+			if ncconfig.useMQTTWait || ncconfig.useLANPassive {
 				go func(c *secure.NegotiatedConn, unregister func()) {
 					if unregister != nil {
 						defer unregister()
@@ -991,28 +1172,486 @@ func runP2PMode(console net.Conn, ncconfig *AppNetcatConfig) int {
 			ncconfig.Logger.Printf("P2P failed: %v\n", err)
 			return 1
 		}
-		if ncconfig.Callback_RegisterShutdown != nil {
-			unregisterShutdown := ncconfig.Callback_RegisterShutdown(func() { nconn.Close() })
-			if unregisterShutdown != nil {
-				defer unregisterShutdown()
-			}
+		if unregisterShutdown := registerP2PConnectionShutdown(ncconfig, nconn); unregisterShutdown != nil {
+			defer unregisterShutdown()
 		}
 		return handleP2PConnection(console, ncconfig, nconn, stats_in, stats_out)
 	}
 }
 
+type p2pAndLanPassivePathID uint8
+
+const (
+	p2pAndLanPassivePublicPath p2pAndLanPassivePathID = iota
+	p2pAndLanPassiveLANPath
+)
+
+type p2pAndLanPassivePath struct {
+	id              p2pAndLanPassivePathID
+	config          *AppNetcatConfig
+	quiet           bool
+	reportConnected bool
+}
+
+func runP2PAndLanPassiveMode(console net.Conn, ncconfig *AppNetcatConfig) int {
+	statsIn := misc.NewProgressStats()
+	statsOut := misc.NewProgressStats()
+	if ncconfig.progressEnabled {
+		wg := &sync.WaitGroup{}
+		done := make(chan bool)
+		defer func() {
+			done <- true
+			wg.Wait()
+		}()
+		showProgress(ncconfig, statsIn, statsOut, done, wg)
+	}
+	ncconfig.Logger.Printf("Parallel LAN discovery enabled (passive mode)\n")
+
+	ctx, cancel := p2pModeContext(ncconfig)
+	defer cancel()
+	publicPath, lanPath := newP2PAndLanPassivePaths(ctx, ncconfig)
+	publicCandidate := &pendingP2PCandidate{}
+
+	// Mux channels always use binary I/O. Set this once before either path can
+	// hand a connection to the application layer, while preserving console I/O
+	// for generic CLI passive sessions.
+	if isEnabledMuxMode(ncconfig) && ncconfig.ConsoleMode {
+		ncconfig.ConsoleMode = false
+	}
+
+	var sessionReadyOnce sync.Once
+	var paths sync.WaitGroup
+	paths.Add(2)
+	go func() {
+		defer paths.Done()
+		runP2PAndLanPassivePath(ctx, console, ncconfig, publicPath, statsIn, statsOut, &sessionReadyOnce, publicCandidate)
+	}()
+	go func() {
+		defer paths.Done()
+		runP2PAndLanPassivePath(ctx, console, ncconfig, lanPath, statsIn, statsOut, &sessionReadyOnce, publicCandidate)
+	}()
+
+	paths.Wait()
+	if ncconfig.Ctx.Err() != nil {
+		ncconfig.Logger.Printf("P2P stopped\n")
+	}
+	return 0
+}
+
+func newP2PAndLanPassivePaths(ctx context.Context, ncconfig *AppNetcatConfig) (p2pAndLanPassivePath, p2pAndLanPassivePath) {
+	publicConfig := *ncconfig
+	publicConfig.Ctx = ctx
+	publicConfig.p2pWithLanMode = false
+	publicConfig.useLAN = false
+	publicConfig.useLANPassive = false
+
+	lanConfig := *ncconfig
+	lanConfig.Ctx = ctx
+	lanConfig.p2pWithLanMode = false
+	lanConfig.useMQTTWait = false
+	lanConfig.useMQTTHello = false
+	lanConfig.useLAN = true
+	lanConfig.useLANPassive = true
+	lanConfig.p2pReportURL = ""
+	lanConfig.LogWriter = io.Discard
+	lanConfig.Logger = log.New(io.Discard, "", 0)
+	if lanConfig.udpProtocol {
+		lanConfig.network = "udp4"
+	} else {
+		lanConfig.network = "tcp4"
+	}
+
+	return p2pAndLanPassivePath{
+			id:     p2pAndLanPassivePublicPath,
+			config: &publicConfig,
+		}, p2pAndLanPassivePath{
+			id:              p2pAndLanPassiveLANPath,
+			config:          &lanConfig,
+			quiet:           true,
+			reportConnected: true,
+		}
+}
+
+func runP2PAndLanPassivePath(
+	ctx context.Context,
+	console net.Conn,
+	ncconfig *AppNetcatConfig,
+	path p2pAndLanPassivePath,
+	statsIn *misc.ProgressStats,
+	statsOut *misc.ProgressStats,
+	sessionReadyOnce *sync.Once,
+	publicCandidate *pendingP2PCandidate,
+) {
+	for ctx.Err() == nil {
+		var nconn *secure.NegotiatedConn
+		var err error
+		if path.id == p2pAndLanPassivePublicPath {
+			nconn, err = doP2PWithCandidateControl(path.config, publicCandidate)
+		} else {
+			nconn, err = do_P2P(path.config)
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			if errors.Is(err, errP2PCandidateSuperseded) {
+				continue
+			}
+			if !path.quiet {
+				ncconfig.Logger.Printf("P2P failed: %v\n", err)
+				ncconfig.Logger.Printf("Will retry in 10 seconds...\n")
+			}
+			if err := netx.WaitContext(ctx, 10*time.Second); err != nil {
+				return
+			}
+			continue
+		}
+		publicCandidateCanceled := false
+		if path.id == p2pAndLanPassiveLANPath {
+			publicCandidateCanceled = publicCandidate.cancelCurrent(errP2PCandidateSuperseded)
+		}
+
+		markP2PSessionReady(ncconfig, statsIn, statsOut, sessionReadyOnce)
+
+		if path.reportConnected {
+			reportSessionID := newP2PReportSessionID()
+			network := nconn.LocalAddr().Network()
+			peer := nconn.RemoteAddr().String()
+			ncconfig.Logger.Printf("Connected to: %s (LAN)\n", peer)
+			if publicCandidateCanceled {
+				ncconfig.Logger.Printf("Pending MQTT P2P candidate canceled (LAN path connected)\n")
+			}
+			ReportP2PStatus(ncconfig, reportSessionID, "connected", network, "LAN", peer)
+			nconn.AddOnClose(func() {
+				ReportP2PStatus(ncconfig, reportSessionID, "disconnected", network, "LAN", peer)
+			})
+		}
+
+		unregisterShutdown := registerP2PConnectionShutdown(ncconfig, nconn)
+		go func(c *secure.NegotiatedConn, unregister func()) {
+			if unregister != nil {
+				defer unregister()
+			}
+			addr := c.RemoteAddr().String()
+			handleP2PConnection(console, ncconfig, c, statsIn, statsOut)
+			if path.reportConnected {
+				ncconfig.Logger.Printf("Disconnected from: %s (LAN)\n", addr)
+			} else {
+				ncconfig.Logger.Printf("Disconnected from: %s\n", addr)
+			}
+		}(nconn, unregisterShutdown)
+
+		if err := netx.WaitContext(ctx, 2*time.Second); err != nil {
+			return
+		}
+	}
+}
+
+type p2pAndLanActivePathID uint8
+
+const (
+	p2pAndLanActivePublicPath p2pAndLanActivePathID = iota
+	p2pAndLanActiveLANPath
+)
+
+type p2pAndLanActivePath struct {
+	id     p2pAndLanActivePathID
+	config *AppNetcatConfig
+	quiet  bool
+}
+
+type p2pAndLanActiveResult struct {
+	path p2pAndLanActivePath
+	conn *secure.NegotiatedConn
+	err  error
+}
+
+type p2pAndLanActiveWinner struct {
+	path   p2pAndLanActivePath
+	conn   *secure.NegotiatedConn
+	cancel context.CancelFunc
+}
+
+type p2pConnectFunc func(*AppNetcatConfig) (*secure.NegotiatedConn, error)
+
+func runP2PAndLanActiveMode(console net.Conn, ncconfig *AppNetcatConfig) int {
+	statsIn := misc.NewProgressStats()
+	statsOut := misc.NewProgressStats()
+	if ncconfig.progressEnabled {
+		wg := &sync.WaitGroup{}
+		done := make(chan bool)
+		defer func() {
+			done <- true
+			wg.Wait()
+		}()
+		showProgress(ncconfig, statsIn, statsOut, done, wg)
+	}
+	ncconfig.Logger.Printf("Parallel LAN discovery enabled (active mode)\n")
+
+	for {
+		winner, err := establishP2PAndLANActiveConnection(ncconfig, ncconfig.keepOpen, do_P2P)
+		if err != nil {
+			if ncconfig.Ctx.Err() != nil || (ncconfig.GlobalCtx != nil && ncconfig.GlobalCtx.Err() != nil) {
+				ncconfig.Logger.Printf("P2P stopped\n")
+				return 0
+			}
+			ncconfig.Logger.Printf("P2P with LAN failed: %v\n", err)
+			return 1
+		}
+
+		peer := winner.conn.RemoteAddr().String()
+		network := winner.conn.LocalAddr().Network()
+		lanWinner := winner.path.id == p2pAndLanActiveLANPath
+		reportSessionID := ""
+		if lanWinner {
+			reportSessionID = newP2PReportSessionID()
+			ncconfig.Logger.Printf("Connected to: %s (LAN)\n", peer)
+			ReportP2PStatus(ncconfig, reportSessionID, "connected", network, "LAN", peer)
+		}
+
+		unregisterShutdown := registerP2PConnectionShutdown(ncconfig, winner.conn)
+		result := handleP2PConnection(console, ncconfig, winner.conn, statsIn, statsOut)
+		if unregisterShutdown != nil {
+			unregisterShutdown()
+		}
+		winner.cancel()
+		if lanWinner {
+			ncconfig.Logger.Printf("Disconnected from: %s (LAN)\n", peer)
+			ReportP2PStatus(ncconfig, reportSessionID, "disconnected", network, "LAN", peer)
+		} else {
+			ncconfig.Logger.Printf("Disconnected from: %s\n", peer)
+		}
+
+		if !ncconfig.keepOpen {
+			return result
+		}
+		if !waitWithGlobalContext(ncconfig, 2*time.Second) {
+			ncconfig.Logger.Printf("P2P stopped\n")
+			return 0
+		}
+	}
+}
+
+func establishP2PAndLANActiveConnection(
+	ncconfig *AppNetcatConfig,
+	retry bool,
+	connect p2pConnectFunc,
+) (p2pAndLanActiveWinner, error) {
+	modeCtx, cancelMode := p2pModeContext(ncconfig)
+	publicCtx, cancelPublicCause := context.WithCancelCause(modeCtx)
+	cancelPublic := func() {
+		cancelPublicCause(nil)
+	}
+	lanCtx, cancelLAN := context.WithCancel(modeCtx)
+	publicPath, lanPath := newP2PAndLanActivePaths(publicCtx, lanCtx, ncconfig)
+
+	// A candidate changes ownership only when this unbuffered handoff completes.
+	// Late candidates remain in their worker and are closed when that path loses.
+	results := make(chan p2pAndLanActiveResult)
+	var workers sync.WaitGroup
+	workers.Add(2)
+	go func() {
+		defer workers.Done()
+		runP2PAndLanActivePath(publicCtx, ncconfig, publicPath, retry, connect, results)
+	}()
+	go func() {
+		defer workers.Done()
+		runP2PAndLanActivePath(lanCtx, ncconfig, lanPath, retry, connect, results)
+	}()
+
+	failures := make([]error, 0, 2)
+	for len(failures) < 2 {
+		select {
+		case <-modeCtx.Done():
+			cancelPublic()
+			cancelLAN()
+			workers.Wait()
+			cancelMode()
+			return p2pAndLanActiveWinner{}, modeCtx.Err()
+		case result := <-results:
+			if result.err != nil {
+				failures = append(failures, result.err)
+				continue
+			}
+			if modeCtx.Err() != nil {
+				_ = result.conn.Close()
+				cancelPublic()
+				cancelLAN()
+				workers.Wait()
+				cancelMode()
+				return p2pAndLanActiveWinner{}, modeCtx.Err()
+			}
+
+			winnerCancel := cancelPublic
+			if result.path.id == p2pAndLanActivePublicPath {
+				cancelLAN()
+			} else {
+				cancelPublicCause(errP2PCandidateSuperseded)
+				winnerCancel = cancelLAN
+			}
+			workers.Wait()
+			return p2pAndLanActiveWinner{
+				path: result.path,
+				conn: result.conn,
+				cancel: func() {
+					winnerCancel()
+					cancelMode()
+				},
+			}, nil
+		}
+	}
+
+	cancelPublic()
+	cancelLAN()
+	workers.Wait()
+	cancelMode()
+	return p2pAndLanActiveWinner{}, errors.Join(failures...)
+}
+
+func newP2PAndLanActivePaths(
+	publicCtx context.Context,
+	lanCtx context.Context,
+	ncconfig *AppNetcatConfig,
+) (p2pAndLanActivePath, p2pAndLanActivePath) {
+	publicConfig := *ncconfig
+	publicConfig.Ctx = publicCtx
+	publicConfig.p2pWithLanMode = false
+	publicConfig.useLAN = false
+	publicConfig.useLANPassive = false
+
+	lanConfig := *ncconfig
+	lanConfig.Ctx = lanCtx
+	lanConfig.p2pWithLanMode = false
+	lanConfig.useMQTTWait = false
+	lanConfig.useMQTTHello = false
+	lanConfig.useLAN = true
+	lanConfig.useLANPassive = false
+	lanConfig.p2pReportURL = ""
+	lanConfig.LogWriter = io.Discard
+	lanConfig.Logger = log.New(io.Discard, "", 0)
+	if lanConfig.udpProtocol {
+		lanConfig.network = "udp4"
+	} else {
+		lanConfig.network = "tcp4"
+	}
+
+	return p2pAndLanActivePath{
+			id:     p2pAndLanActivePublicPath,
+			config: &publicConfig,
+		}, p2pAndLanActivePath{
+			id:     p2pAndLanActiveLANPath,
+			config: &lanConfig,
+			quiet:  true,
+		}
+}
+
+func runP2PAndLanActivePath(
+	ctx context.Context,
+	ncconfig *AppNetcatConfig,
+	path p2pAndLanActivePath,
+	retry bool,
+	connect p2pConnectFunc,
+	results chan<- p2pAndLanActiveResult,
+) {
+	for ctx.Err() == nil {
+		nconn, err := connect(path.config)
+		if err == nil && nconn == nil {
+			err = fmt.Errorf("P2P path returned an empty connection")
+		}
+		if err == nil {
+			if ctx.Err() != nil {
+				_ = nconn.Close()
+				return
+			}
+			select {
+			case results <- p2pAndLanActiveResult{path: path, conn: nconn}:
+			case <-ctx.Done():
+				_ = nconn.Close()
+			}
+			return
+		}
+
+		if ctx.Err() != nil {
+			return
+		}
+		if !retry {
+			select {
+			case results <- p2pAndLanActiveResult{path: path, err: err}:
+			case <-ctx.Done():
+			}
+			return
+		}
+		if !path.quiet {
+			ncconfig.Logger.Printf("P2P failed: %v\n", err)
+			ncconfig.Logger.Printf("Will retry in 10 seconds...\n")
+		}
+		if err := netx.WaitContext(ctx, 10*time.Second); err != nil {
+			return
+		}
+	}
+}
+
 func waitWithGlobalContext(ncconfig *AppNetcatConfig, d time.Duration) bool {
-	if ncconfig == nil || ncconfig.GlobalCtx == nil {
+	if ncconfig == nil {
 		time.Sleep(d)
 		return true
 	}
 
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	var ctxDone <-chan struct{}
+	var globalDone <-chan struct{}
+	if ncconfig.Ctx != nil {
+		ctxDone = ncconfig.Ctx.Done()
+	}
+	if ncconfig.GlobalCtx != nil {
+		globalDone = ncconfig.GlobalCtx.Done()
+	}
+
 	select {
-	case <-time.After(d):
+	case <-timer.C:
 		return true
-	case <-ncconfig.GlobalCtx.Done():
+	case <-ctxDone:
+		return false
+	case <-globalDone:
 		return false
 	}
+}
+
+func p2pModeContext(ncconfig *AppNetcatConfig) (context.Context, context.CancelFunc) {
+	parent := context.Background()
+	if ncconfig != nil && ncconfig.Ctx != nil {
+		parent = ncconfig.Ctx
+	}
+	ctx, cancel := context.WithCancel(parent)
+	if ncconfig == nil || ncconfig.GlobalCtx == nil {
+		return ctx, cancel
+	}
+
+	stopGlobalCancel := context.AfterFunc(ncconfig.GlobalCtx, cancel)
+	return ctx, func() {
+		stopGlobalCancel()
+		cancel()
+	}
+}
+
+func registerP2PConnectionShutdown(ncconfig *AppNetcatConfig, nconn *secure.NegotiatedConn) func() {
+	if ncconfig == nil || nconn == nil || ncconfig.Callback_RegisterShutdown == nil {
+		return nil
+	}
+	return ncconfig.Callback_RegisterShutdown(func() { _ = nconn.Close() })
+}
+
+func markP2PSessionReady(ncconfig *AppNetcatConfig, statsIn, statsOut *misc.ProgressStats, once *sync.Once) {
+	once.Do(func() {
+		statsIn.ResetStart()
+		statsOut.ResetStart()
+		ncconfig.sessionReady = true
+		if ncconfig.Callback_OnSessionReady != nil {
+			ncconfig.Callback_OnSessionReady()
+		}
+	})
 }
 
 // runListenMode 在监听模式下启动服务器
@@ -1184,6 +1823,15 @@ func startTCPListener(console net.Conn, ncconfig *AppNetcatConfig, network, host
 			return 1
 		}
 		defer listener.Close()
+	}
+
+	if ncconfig.proxyProtocolEnabled {
+		if listener.Addr().Network() == "unix" {
+			ncconfig.Logger.Printf("Warning: -pp is ignored on unix-domain sockets\n")
+		} else {
+			listener = NewPPListener(listener)
+			ncconfig.Logger.Printf("PROXY protocol v1/v2 acceptance enabled (strict)\n")
+		}
 	}
 
 	ncconfig.Logger.Printf("Listening %s on %s\n", listener.Addr().Network(), listener.Addr().String())
@@ -1469,7 +2117,7 @@ func runHTTPDownload(console net.Conn, ncconfig *AppNetcatConfig) int {
 		Resume:                 true,
 		DryRun:                 false,
 		Verbose:                false,
-		LogLevel:               httpfileshare.LogLevelError,
+		LogLevel:               httpfileshare.LogLevelRepair,
 		LoggerOutput:           ncconfig.LogWriter,
 		ProgressOutput:         ncconfig.LogWriter,
 		ProgressUpdateInterval: 1 * time.Second,
@@ -1508,13 +2156,15 @@ func runNATChecker(console net.Conn, ncconfig *AppNetcatConfig) int {
 	ncconfig.Logger.Printf("STUN Results (Local -> NAT -> STUNServer)\n")
 	ncconfig.Logger.Printf("-----------\n")
 
+	stunStart := time.Now()
 	Addresses, allSTUNResults, err := easyp2p.DetectNATAddressInfo(networksToTryStun, ncconfig.localbind, nil, io.Discard)
+	stunElapsed := time.Since(stunStart).Truncate(time.Millisecond)
 	if len(allSTUNResults) > 0 && len(Addresses) > 0 {
 		for _, r := range allSTUNResults {
 			srv := strings.TrimPrefix(easyp2p.STUNServers[r.Index], "udp://")
 			srv = strings.TrimPrefix(srv, "tcp://")
 			if r.Err != nil {
-				ncconfig.Logger.Printf("%s://%s\t(failed)\n", r.Network, srv)
+				ncconfig.Logger.Printf("%s://%s\t(failed, elapsed %s)\n", r.Network, srv, r.Elapsed)
 			}
 		}
 
@@ -1524,13 +2174,13 @@ func runNATChecker(console net.Conn, ncconfig *AppNetcatConfig) int {
 			srv = strings.TrimPrefix(srv, "tcp://")
 			if r.Err == nil {
 				succeeded += 1
-				ncconfig.Logger.Printf("%s://%s\n", r.Network, srv)
+				ncconfig.Logger.Printf("%s://%s\t(elapsed %s)\n", r.Network, srv, r.Elapsed)
 				ncconfig.Logger.Printf("    %s -> %s -> %s\n", r.Local, r.Nat, r.Remote)
 			}
 		}
 
 		ncconfig.Logger.Printf("\n")
-		ncconfig.Logger.Printf("NAT Summary (%d STUN servers, %d answers)\n", len(easyp2p.STUNServers), succeeded)
+		ncconfig.Logger.Printf("NAT Summary (%d STUN servers, %d answers, elapsed %s)\n", len(easyp2p.STUNServers), succeeded, stunElapsed)
 		ncconfig.Logger.Printf("-----------\n")
 
 		for _, info := range Addresses {
@@ -1547,7 +2197,11 @@ func runNATChecker(console net.Conn, ncconfig *AppNetcatConfig) int {
 
 		return 0
 	} else {
-		ncconfig.Logger.Printf("failed: %v\n", err)
+		if err != nil {
+			ncconfig.Logger.Printf("failed after %s: %v\n", stunElapsed, err)
+		} else {
+			ncconfig.Logger.Printf("failed after %s\n", stunElapsed)
+		}
 	}
 
 	return 1
@@ -1621,7 +2275,11 @@ func runKCPBridge(console net.Conn, ncconfig *AppNetcatConfig) int {
 		}
 		disableTLS(&nc1)
 		nc1.presharedKey = ""
-		nc1.connConfig = preinitNegotiationConfig(&nc1)
+		nc1.connConfig, err = preinitNegotiationConfig(&nc1)
+		if err != nil {
+			ncconfig.Logger.Printf("%v\n", err)
+			return 1
+		}
 
 		nc1.callback_OnConnectionDestroy = func(localAddrStr, remoteAddrStr string) {
 			found := brDialSessKickByConnAddr(
@@ -1654,7 +2312,11 @@ func runKCPBridge(console net.Conn, ncconfig *AppNetcatConfig) int {
 			ncconfig.Logger.Printf("%v\n", err)
 			return 1
 		}
-		nc2.connConfig = preinitNegotiationConfig(&nc2)
+		nc2.connConfig, err = preinitNegotiationConfig(&nc2)
+		if err != nil {
+			ncconfig.Logger.Printf("%v\n", err)
+			return 1
+		}
 		nc2.connConfig.UDPIdleTimeoutSecond = 41
 		nc2.progressEnabled = false
 
@@ -1700,7 +2362,11 @@ func runKCPBridge(console net.Conn, ncconfig *AppNetcatConfig) int {
 		disableTLS(&nc2)
 		nc2.presharedKey = ""
 		nc2.keepAlive = ncconfig.keepAlive
-		nc2.connConfig = preinitNegotiationConfig(&nc2)
+		nc2.connConfig, err = preinitNegotiationConfig(&nc2)
+		if err != nil {
+			ncconfig.Logger.Printf("%v\n", err)
+			return 1
+		}
 		err = preinitBuiltinAppConfig(&nc2, nc2.runCmd)
 		if err != nil {
 			ncconfig.Logger.Printf("%v\n", err)
@@ -1719,7 +2385,11 @@ func runKCPBridge(console net.Conn, ncconfig *AppNetcatConfig) int {
 		nc1.kcpEnabled = true
 		nc1.kcpSEnabled = false
 		nc1.keepAlive = ncconfig.keepAlive
-		nc1.connConfig = preinitNegotiationConfig(&nc1)
+		nc1.connConfig, err = preinitNegotiationConfig(&nc1)
+		if err != nil {
+			ncconfig.Logger.Printf("%v\n", err)
+			return 1
+		}
 		nc1.runCmd = ncconfig.runCmd
 		err = preinitBuiltinAppConfig(&nc2, nc1.runCmd)
 		if err != nil {
@@ -1762,7 +2432,7 @@ func runKCPBridge(console net.Conn, ncconfig *AppNetcatConfig) int {
 	}
 }
 
-func init_TLS(ncconfig *AppNetcatConfig, genCertForced bool) []tls.Certificate {
+func init_TLS(ncconfig *AppNetcatConfig, genCertForced bool) ([]tls.Certificate, error) {
 	var certs []tls.Certificate
 	if isTLSEnabled(ncconfig) {
 		if ncconfig.listenMode || ncconfig.kcpSEnabled {
@@ -1773,16 +2443,14 @@ func init_TLS(ncconfig *AppNetcatConfig, genCertForced bool) []tls.Certificate {
 				ncconfig.Logger.Printf("Loading cert...")
 				cert, err := secure.LoadCertificate(ncconfig.sslCertFile, ncconfig.sslKeyFile)
 				if err != nil {
-					ncconfig.Logger.Printf("Error load certificate: %v\n", err)
-					os.Exit(1)
+					return nil, fmt.Errorf("error load certificate: %w", err)
 				}
 				certs = append(certs, *cert)
 				ncconfig.tlsECCertEnabled = false
 				ncconfig.tlsRSACertEnabled = false
 			} else {
 				if !ncconfig.tlsECCertEnabled && !ncconfig.tlsRSACertEnabled {
-					ncconfig.Logger.Printf("EC and RSA both are disabled\n")
-					os.Exit(1)
+					return nil, fmt.Errorf("EC and RSA both are disabled")
 				}
 				if ncconfig.tlsECCertEnabled {
 					if ncconfig.presharedKey != "" {
@@ -1792,8 +2460,7 @@ func init_TLS(ncconfig *AppNetcatConfig, genCertForced bool) []tls.Certificate {
 					}
 					cert, err := secure.GenerateECDSACertificate(ncconfig.tlsSNI, ncconfig.presharedKey)
 					if err != nil {
-						ncconfig.Logger.Printf("Error generating EC certificate: %v\n", err)
-						os.Exit(1)
+						return nil, fmt.Errorf("error generating EC certificate: %w", err)
 					}
 					certs = append(certs, *cert)
 				}
@@ -1801,8 +2468,7 @@ func init_TLS(ncconfig *AppNetcatConfig, genCertForced bool) []tls.Certificate {
 					ncconfig.Logger.Printf("Generating RSA cert...")
 					cert, err := secure.GenerateRSACertificate(ncconfig.tlsSNI)
 					if err != nil {
-						ncconfig.Logger.Printf("Error generating RSA certificate: %v\n", err)
-						os.Exit(1)
+						return nil, fmt.Errorf("error generating RSA certificate: %w", err)
 					}
 					certs = append(certs, *cert)
 				}
@@ -1811,7 +2477,7 @@ func init_TLS(ncconfig *AppNetcatConfig, genCertForced bool) []tls.Certificate {
 			ncconfig.Logger.Printf("Certificate initialization completed.")
 		}
 	}
-	return certs
+	return certs, nil
 }
 
 func isTLSEnabled(ncconfig *AppNetcatConfig) bool {
@@ -1844,6 +2510,17 @@ func showProgress(ncconfig *AppNetcatConfig, statsIn, statsOut *misc.ProgressSta
 					m := (elapsed % 3600) / 60
 					s := elapsed % 60
 					connCount := atomic.LoadInt32(&ncconfig.goroutineConnectionCounter)
+					if ncconfig.ProgressSink != nil {
+						ncconfig.ProgressSink(ProgressSnapshot{
+							InBytes:   in.TotalBytes,
+							OutBytes:  out.TotalBytes,
+							InBps:     in.SpeedBps,
+							OutBps:    out.SpeedBps,
+							Elapsed:   elapsed,
+							ConnCount: int(connCount),
+						})
+						continue
+					}
 					if connCount > 1 {
 						fmt.Fprintf(ncconfig.LogWriter,
 							"IN: %s (%d bytes), %s/s | OUT: %s (%d bytes), %s/s | %d | %02d:%02d:%02d\r",
@@ -1871,6 +2548,18 @@ func showProgress(ncconfig *AppNetcatConfig, statsIn, statsOut *misc.ProgressSta
 					in := statsIn.Stats(now, true)
 					out := statsOut.Stats(now, true)
 					elapsed := int(now.Sub(statsIn.StartTime()).Seconds())
+					if ncconfig.ProgressSink != nil {
+						ncconfig.ProgressSink(ProgressSnapshot{
+							InBytes:   in.TotalBytes,
+							OutBytes:  out.TotalBytes,
+							InBps:     in.SpeedBps,
+							OutBps:    out.SpeedBps,
+							Elapsed:   elapsed,
+							ConnCount: int(atomic.LoadInt32(&ncconfig.goroutineConnectionCounter)),
+							Final:     true,
+						})
+						return
+					}
 					h := elapsed / 3600
 					m := (elapsed % 3600) / 60
 					s := elapsed % 60
@@ -1914,6 +2603,10 @@ func usage_less(logWriter io.Writer, argv0 string) {
 }
 
 func conflictCheck(ncconfig *AppNetcatConfig) int {
+	if ncconfig.useMQTTWait && ncconfig.useMQTTHello {
+		ncconfig.Logger.Printf("-mqtt-wait and -mqtt-hello cannot be used together\n")
+		return 1
+	}
 	if ncconfig.sendfile != "" && ncconfig.runCmd != "" {
 		ncconfig.Logger.Printf("-send and -exec cannot be used together\n")
 		return 1
@@ -1940,6 +2633,18 @@ func conflictCheck(ncconfig *AppNetcatConfig) int {
 	}
 	if ncconfig.useIPv4 && ncconfig.useIPv6 {
 		ncconfig.Logger.Printf("-4 and -6 cannot be used together\n")
+		return 1
+	}
+	if ncconfig.p2pWithLanMode && ncconfig.autoP2P == "" {
+		ncconfig.Logger.Printf("-p2p-with-lan must be used with -p2p\n")
+		return 1
+	}
+	if ncconfig.p2pWithLanMode && (ncconfig.useLAN || ncconfig.useLANPassive) {
+		ncconfig.Logger.Printf("-p2p-with-lan cannot be used with -lan or -lan-passive\n")
+		return 1
+	}
+	if ncconfig.p2pWithLanMode && ncconfig.useMQTTWait && !ncconfig.keepOpen {
+		ncconfig.Logger.Printf("passive -p2p-with-lan mode requires -keep-open\n")
 		return 1
 	}
 	if ncconfig.useUNIXdomain && (ncconfig.useIPv6 || ncconfig.useIPv4 || ncconfig.useSTUN || ncconfig.udpProtocol || ncconfig.kcpEnabled || ncconfig.kcpSEnabled || ncconfig.localbind != "" || ncconfig.proxyAddr != "") {
@@ -2016,6 +2721,9 @@ func preinitBuiltinAppConfig(ncconfig *AppNetcatConfig, commandline string) erro
 		ncconfig.app_s5s_Config, err = AppS5SConfigByArgs(ncconfig.LogWriter, args[1:])
 		if err == nil {
 			ncconfig.app_s5s_Config.AccessCtrl = ncconfig.accessControl
+			if ncconfig.app_s5s_Config.UpstreamClient != nil && ncconfig.accessControl != nil {
+				ncconfig.Logger.Printf(":s5s -x enabled: outbound ACL checks the requested host and port; resolved-IP rules cannot be verified because DNS is handled by the upstream proxy.\n")
+			}
 		}
 	case ":s5c":
 		ncconfig.app_s5c_Config, err = AppS5CConfigByArgs(ncconfig.LogWriter, args[1:])
@@ -2070,6 +2778,13 @@ func copyWithProgress(ncconfig *AppNetcatConfig, dst io.Writer, src io.Reader, b
 	var totalWritten int64
 
 	for {
+		if ncconfig.Ctx != nil {
+			select {
+			case <-ncconfig.Ctx.Done():
+				return ncconfig.Ctx.Err()
+			default:
+			}
+		}
 		rtimeout := false
 		if readIdleTimeout > 0 {
 			type readDeadliner interface {
@@ -2164,15 +2879,20 @@ func copyCharDeviceWithProgress(ncconfig *AppNetcatConfig, dst io.Writer, src io
 	}
 }
 
-func preinitNegotiationConfig(ncconfig *AppNetcatConfig) *secure.NegotiationConfig {
+func preinitNegotiationConfig(ncconfig *AppNetcatConfig) (*secure.NegotiationConfig, error) {
 	config := secure.NewNegotiationConfig()
+	config.DisableGracefulClose = ncconfig.speedTestDuration > 0
 
 	config.Context = ncconfig.Ctx
 	config.InsecureSkipVerify = !ncconfig.tlsVerifyCert
 	config.KeepAlive = ncconfig.keepAlive
 
 	genCertForced := ncconfig.presharedKey != ""
-	config.Certs = init_TLS(ncconfig, genCertForced)
+	certs, err := init_TLS(ncconfig, genCertForced)
+	if err != nil {
+		return nil, err
+	}
+	config.Certs = certs
 	config.TlsSNI = ncconfig.tlsSNI
 	config.ReadIdleTimeoutSecond = ncconfig.dialreadTimeout
 	if ncconfig.dialreadTimeout != 0 {
@@ -2223,7 +2943,7 @@ func preinitNegotiationConfig(ncconfig *AppNetcatConfig) *secure.NegotiationConf
 		config.FramedTCP = ncconfig.framedTCP
 	}
 
-	return config
+	return config, nil
 }
 
 func handleMuxChannelConnection(console net.Conn, ncconfig *AppNetcatConfig, channel net.Conn, stats_in, stats_out *misc.ProgressStats) int {
@@ -2241,6 +2961,27 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 	atomic.AddInt32(&ncconfig.goroutineConnectionCounter, 1)
 
 	defer nconn.Close()
+	var ctxDone <-chan struct{}
+	var globalDone <-chan struct{}
+	if ncconfig.Ctx != nil {
+		ctxDone = ncconfig.Ctx.Done()
+	}
+	if ncconfig.GlobalCtx != nil {
+		globalDone = ncconfig.GlobalCtx.Done()
+	}
+	if ctxDone != nil || globalDone != nil {
+		watchStop := make(chan struct{})
+		defer close(watchStop)
+		go func() {
+			select {
+			case <-ctxDone:
+				_ = nconn.Close()
+			case <-globalDone:
+				_ = nconn.Close()
+			case <-watchStop:
+			}
+		}()
+	}
 
 	localAddrStr := nconn.LocalAddr().String()
 	remoteAddrStr := nconn.RemoteAddr().String()
@@ -2501,9 +3242,29 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 	var wg sync.WaitGroup
 	done := make(chan struct{})
 	abort := make(chan struct{})
+	connWriter := io.Writer(nconn)
+	outputWriter := io.Writer(output)
+	resizeStop := make(chan struct{})
+	var resizeStopOnce sync.Once
+	var resizeStartOnce sync.Once
+	if ncconfig.enablePty {
+		lockedConnWriter := &lockedWriter{w: nconn}
+		connWriter = lockedConnWriter
+		outputWriter = newPtyshCapsOutputWriter(output, func(sid []byte) {
+			resizeStartOnce.Do(func() {
+				go startPtyshResizeSender(resizeStop, lockedConnWriter, sid, ncconfig.Logger)
+			})
+		})
+	}
 	inExited := make(chan struct{})  //
 	outExited := make(chan struct{}) //
 	wg.Add(2)
+	var speedTestTimer *time.Timer
+	var speedTestTimeout <-chan time.Time
+	if ncconfig.speedTestDuration > 0 {
+		speedTestTimer = time.NewTimer(ncconfig.speedTestDuration)
+		speedTestTimeout = speedTestTimer.C
+	}
 
 	go func() {
 		defer wg.Done()
@@ -2518,15 +3279,16 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 					return
 				}
 				defer term.Restore(int(os.Stdin.Fd()), ncconfig.term_oldstat)
-				copyWithProgress(ncconfig, nconn, input, blocksize, !nconn.IsUDP, stats_out, 0, 0)
+				copyWithProgress(ncconfig, connWriter, input, blocksize, !nconn.IsUDP, stats_out, 0, 0)
 			} else {
 				copyCharDeviceWithProgress(ncconfig, nconn, input, stats_out)
 			}
 		} else {
-			copyWithProgress(ncconfig, nconn, input, blocksize, !nconn.IsUDP, stats_out, maxSendBytes, 0)
+			copyWithProgress(ncconfig, connWriter, input, blocksize, !nconn.IsUDP, stats_out, maxSendBytes, 0)
 		}
 
 		time.Sleep(1 * time.Second)
+		resizeStopOnce.Do(func() { close(resizeStop) })
 		nconn.CloseWrite()
 		//ncconfig.Logger.Printf("PID:%d (%s) conn-write routine completed.\n", os.Getpid(), nconn.RemoteAddr().String())
 	}()
@@ -2535,7 +3297,7 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 		defer wg.Done()
 		defer close(inExited)
 
-		copyWithProgress(ncconfig, output, nconn, bufsize, !nconn.IsUDP, stats_in, 0, ncconfig.dialreadTimeout)
+		copyWithProgress(ncconfig, outputWriter, nconn, bufsize, !nconn.IsUDP, stats_in, 0, ncconfig.dialreadTimeout)
 		time.Sleep(1 * time.Second)
 		//ncconfig.Logger.Printf("PID:%d (%s) conn-read routine completed.\n", os.Getpid(), nconn.RemoteAddr().String())
 	}()
@@ -2552,12 +3314,19 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 		close(done)
 	}()
 
-	// 等第一个 goroutine 退出
+	speedTestExpired := false
+	// 等第一个 goroutine 退出，或等待测速时间到达。
 	select {
 	case <-inExited:
 		close(abort)
 	case <-outExited:
 		//
+	case <-speedTestTimeout:
+		speedTestExpired = true
+		nconn.Close()
+	}
+	if speedTestTimer != nil {
+		speedTestTimer.Stop()
 	}
 	select {
 	case <-abort:
@@ -2569,6 +3338,7 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 	}
 
 	//ncconfig.Logger.Printf("PID:%d (%s) closing nconn...\n", os.Getpid(), nconn.RemoteAddr().String())
+	resizeStopOnce.Do(func() { close(resizeStop) })
 	nconn.Close()
 	if ncconfig.term_oldstat != nil {
 		term.Restore(int(os.Stdin.Fd()), ncconfig.term_oldstat)
@@ -2578,6 +3348,9 @@ func handleNegotiatedConnection(console net.Conn, ncconfig *AppNetcatConfig, nco
 		//ncconfig.Logger.Printf("PID:%d killing cmd process...\n", os.Getpid())
 		cmd.Process.Kill()
 		cmd.Wait()
+	}
+	if speedTestExpired {
+		ncconfig.Logger.Printf("Speed test completed after %s\n", ncconfig.speedTestDuration)
 	}
 	//ncconfig.Logger.Printf("PID:%d (%s) connection done.\n", os.Getpid(), nconn.RemoteAddr().String())
 	return 0
@@ -2601,7 +3374,7 @@ func handleSingleConnection(console net.Conn, ncconfig *AppNetcatConfig, conn ne
 }
 
 func handleConnection(console net.Conn, ncconfig *AppNetcatConfig, cfg *secure.NegotiationConfig, conn net.Conn, stats_in, stats_out *misc.ProgressStats) int {
-	nconn, err := secure.DoNegotiation(cfg, conn, ncconfig.LogWriter)
+	nconn, err := secure.DoNegotiationContext(ncconfig.Ctx, cfg, conn, ncconfig.Logger)
 	if err != nil {
 		conn.Close()
 		fmt.Fprintf(ncconfig.LogWriter, "%sError: %v\n", cfg.Label, err)
@@ -2765,47 +3538,117 @@ func isKCPEnabled(ncconfig *AppNetcatConfig) bool {
 	return ncconfig.udpProtocol && (ncconfig.kcpEnabled || ncconfig.kcpSEnabled)
 }
 
-func ShowPublicIP(ncconfig *AppNetcatConfig, network, bind string) error {
-	index, _, nata, err := easyp2p.GetPublicIP(network, bind, 7*time.Second)
-	if err == nil {
-		ncconfig.Logger.Printf("Public Address: %s (via %s)\n", nata, easyp2p.STUNServers[index])
+func firstSuccessfulSTUNResult(results []*easyp2p.STUNResult) (*easyp2p.STUNResult, error) {
+	var failures []error
+	for _, result := range results {
+		if result == nil {
+			continue
+		}
+		if result.Err != nil {
+			failures = append(failures, result.Err)
+			continue
+		}
+		if result.Nat == "" {
+			failures = append(failures, fmt.Errorf("STUN server %d returned an empty public address", result.Index))
+			continue
+		}
+		if result.Index < 0 || result.Index >= len(easyp2p.STUNServers) {
+			return nil, fmt.Errorf("STUN result server index %d is out of range", result.Index)
+		}
+		return result, nil
 	}
-
-	return err
+	if len(failures) > 0 {
+		return nil, fmt.Errorf("all STUN servers failed: %w", errors.Join(failures...))
+	}
+	return nil, fmt.Errorf("no STUN results returned")
 }
 
-func Mqtt_ensure_ready(ncconfig *AppNetcatConfig) (string, error) {
+func ShowPublicIP(ncconfig *AppNetcatConfig, network, bind string) error {
+	results, err := easyp2p.GetPublicIPs(network, bind, 3500*time.Millisecond, false, nil)
+	if err != nil {
+		return err
+	}
+	result, err := firstSuccessfulSTUNResult(results)
+	if err != nil {
+		return err
+	}
+
+	ncconfig.Logger.Printf("Public Address: %s (via %s)\n", result.Nat, easyp2p.STUNServers[result.Index])
+	return nil
+}
+
+func Mqtt_ensure_ready(ncconfig *AppNetcatConfig, reportSessionID string) (string, *easyp2p.MQTTSignalSession, error) {
 	var err error
 	var salt string
+	var signal *easyp2p.MQTTSignalSession
 
 	if ncconfig.useMQTTWait {
-		ReportP2PStatus(ncconfig, "", "wait", ncconfig.network, "", "")
-		salt, err = easyp2p.MqttWait(ncconfig.Ctx, ncconfig.p2pSessionKey, ncconfig.localbindIP, 30*time.Minute, ncconfig.LogWriter)
+		ReportP2PStatus(ncconfig, reportSessionID, "wait", ncconfig.network, "", "")
+		salt, signal, err = easyp2p.MqttWaitSession(ncconfig.Ctx, ncconfig.p2pSessionKey, ncconfig.localbindIP, 30*time.Minute, ncconfig.LogWriter)
 		if err != nil {
-			return "", fmt.Errorf("mqtt-wait: %v", err)
+			return "", nil, fmt.Errorf("mqtt-wait: %v", err)
 		}
 	}
 
 	if ncconfig.useMQTTHello {
-		ReportP2PStatus(ncconfig, "", "wait", ncconfig.network, "", "")
-		salt, err = easyp2p.MQTTHello(ncconfig.Ctx, ncconfig.p2pSessionKey, ncconfig.localbindIP, ncconfig.MQTTHelloPayload, 15*time.Second, ncconfig.LogWriter)
+		ReportP2PStatus(ncconfig, reportSessionID, "wait", ncconfig.network, "", "")
+		salt, signal, err = easyp2p.MQTTHelloSession(ncconfig.Ctx, ncconfig.p2pSessionKey, ncconfig.localbindIP, ncconfig.MQTTHelloPayload, 15*time.Second, ncconfig.LogWriter)
 		if err != nil {
-			return "", fmt.Errorf("mqtt-hello: %v", err)
+			return "", nil, fmt.Errorf("mqtt-hello: %v", err)
 		}
 	}
-	return salt, nil
+	return salt, signal, nil
 }
 
 func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
+	return doP2PWithCandidateControl(ncconfig, nil)
+}
+
+func p2pCandidateHasGuaranteedHandshakeBoundary(ncconfig *AppNetcatConfig, cipherSuite string) bool {
+	switch cipherSuite {
+	case "", "tls":
+		// The selected transport will use TLS over TCP or DTLS over UDP.
+		return true
+	case "ss":
+		// Forced UDP guarantees KCP; automatic transport may choose handshake-free TCP.
+		return ncconfig.udpProtocol
+	case "plain":
+		// Plain P2P normally has no handshake, but honor an explicitly enabled KCP layer.
+		return isKCPEnabled(ncconfig)
+	default:
+		return false
+	}
+}
+
+func reportP2PPathError(ncconfig *AppNetcatConfig, ctx context.Context, reportSessionID string, err error) error {
+	if errors.Is(err, errP2PCandidateSuperseded) || errors.Is(context.Cause(ctx), errP2PCandidateSuperseded) {
+		return errP2PCandidateSuperseded
+	}
+	ReportP2PStatus(ncconfig, reportSessionID, fmt.Sprintf("error:%v", err), ncconfig.network, "", "")
+	return err
+}
+
+func rejectSupersededP2PConnection(ctx context.Context, nconn *secure.NegotiatedConn) error {
+	if !errors.Is(context.Cause(ctx), errP2PCandidateSuperseded) {
+		return nil
+	}
+	if nconn != nil {
+		_ = nconn.Close()
+	}
+	return errP2PCandidateSuperseded
+}
+
+func doP2PWithCandidateControl(ncconfig *AppNetcatConfig, candidate *pendingP2PCandidate) (*secure.NegotiatedConn, error) {
+	reportSessionID := newP2PReportSessionID()
 	//使用其他客户端push过来的salt，构建一个仅和对端单独共享的topic，避免P2P交换地址时有多个端点在一起错乱发生
 
-	topicSalt, err := Mqtt_ensure_ready(ncconfig)
+	topicSalt, mqttSignalSession, err := Mqtt_ensure_ready(ncconfig, reportSessionID)
 	if err != nil {
-		ReportP2PStatus(ncconfig, "", fmt.Sprintf("error:%v", err), ncconfig.network, "", "")
-		return nil, err
+		return nil, reportP2PPathError(ncconfig, ncconfig.Ctx, reportSessionID, err)
 	}
-
-	ReportP2PStatus(ncconfig, topicSalt, "connecting", ncconfig.network, "", "")
+	if mqttSignalSession != nil {
+		defer mqttSignalSession.Close()
+	}
 
 	cipherSuite := ""
 	if ncconfig.plainTransport {
@@ -2823,7 +3666,7 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 		case "br":
 			//Wait模式，如果对方hello的载荷是bridge类型，则提前验证session是否接受，免得浪费资源建立连接
 			if !Bridge_IsP2PHelloAllowed(helloPayload.AppString()) {
-				ReportP2PStatus(ncconfig, topicSalt, "error:bridge session not found", ncconfig.network, "", "")
+				ReportP2PStatus(ncconfig, reportSessionID, "error:bridge session not found", ncconfig.network, "", "")
 				return nil, fmt.Errorf("bridge session not found: %s", helloPayload.AppString())
 			}
 		}
@@ -2838,22 +3681,51 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 		}
 	}
 
-	var connInfo *easyp2p.P2PConnInfo
+	p2pCtx := ncconfig.Ctx
+	p2pOptions := easyp2p.EasyP2PMPOptions{}
+	var candidateToken uint64
+	candidateControlled := candidate != nil && !ncconfig.useLAN
+	extendCandidateWindow := candidateControlled && p2pCandidateHasGuaranteedHandshakeBoundary(ncconfig, cipherSuite)
+	candidateOwnsPath := !candidateControlled
+	if candidateControlled {
+		candidateCtx, cancelCandidate := context.WithCancelCause(ncconfig.Ctx)
+		candidateToken = candidate.arm(cancelCandidate)
+		p2pCtx = candidateCtx
+		if !extendCandidateWindow {
+			p2pOptions.OnAddressExchangeDone = func() {
+				candidateOwnsPath = candidate.disarm(candidateToken)
+			}
+		}
+		defer func() {
+			candidate.disarm(candidateToken)
+			cancelCandidate(nil)
+		}()
+	}
 
+	var connInfo *easyp2p.P2PConnInfo
+	statusMode := ""
 	if ncconfig.useLAN {
 		// ─── LAN 模式分支 ───
+		ReportP2PStatus(ncconfig, reportSessionID, "discovering", ncconfig.network, "", "")
+
 		transportPref := easyp2p.LANTransportFromConfig(ncconfig.udpProtocol)
-		connInfo, err = easyp2p.Easy_P2P_LAN(ncconfig.Ctx, ncconfig.p2pSessionKey+topicSalt, transportPref, 90*time.Second, ncconfig.LogWriter)
+		if ncconfig.useLANPassive {
+			connInfo, err = easyp2p.Easy_P2P_LAN_Passive(ncconfig.Ctx, ncconfig.p2pSessionKey+topicSalt, transportPref, 90*time.Second, ncconfig.LogWriter)
+		} else {
+			connInfo, err = easyp2p.Easy_P2P_LAN(ncconfig.Ctx, ncconfig.p2pSessionKey+topicSalt, transportPref, 90*time.Second, ncconfig.LogWriter)
+		}
 		if err != nil {
-			ReportP2PStatus(ncconfig, topicSalt, fmt.Sprintf("error:%v", err), ncconfig.network, "", "")
+			ReportP2PStatus(ncconfig, reportSessionID, fmt.Sprintf("error:%v", err), ncconfig.network, "", "")
 			return nil, err
 		}
+		statusMode = "LAN"
 	} else {
 		// ─── STUN/NAT 打洞 ───
+		ReportP2PStatus(ncconfig, reportSessionID, "connecting", ncconfig.network, "", "")
 		var relayConn *easyp2p.RelayPacketConn
 		socks5UDPClient, err := CreateSocks5UDPClient(ncconfig.arg_proxyc_Config)
 		if err != nil {
-			ReportP2PStatus(ncconfig, topicSalt, fmt.Sprintf("error: socks5: %v", err), ncconfig.network, "", "")
+			ReportP2PStatus(ncconfig, reportSessionID, fmt.Sprintf("error: socks5: %v", err), ncconfig.network, "", "")
 			return nil, fmt.Errorf("prepare socks5 UDP client failed: %v", err)
 		} else if socks5UDPClient != nil {
 			relayConn = &easyp2p.RelayPacketConn{
@@ -2865,24 +3737,55 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 		}
 
 		//sessionKey+topicSalt组合成和对端单独共享的mqtt topic
-		connInfo, err = easyp2p.Easy_P2P_MP(ncconfig.Ctx, ncconfig.network, ncconfig.localbind, ncconfig.p2pSessionKey+topicSalt, false, relayConn, ncconfig.LogWriter)
+		p2pOptions.Bind = ncconfig.localbind
+		p2pOptions.RelayConn = relayConn
+		p2pOptions.LogWriter = ncconfig.LogWriter
+		p2pOptions.Signal = mqttSignalSession
+		connInfo, err = easyp2p.Easy_P2P_MPWithOptions(
+			p2pCtx,
+			ncconfig.network,
+			ncconfig.p2pSessionKey+topicSalt,
+			p2pOptions,
+		)
 		if err != nil {
 			if relayConn != nil {
 				relayConn.Close()
 			}
-			ReportP2PStatus(ncconfig, topicSalt, fmt.Sprintf("error:%v", err), ncconfig.network, "", "")
-			return nil, err
+			return nil, reportP2PPathError(ncconfig, p2pCtx, reportSessionID, err)
+		}
+		if extendCandidateWindow {
+			candidateOwnsPath = candidate.disarm(candidateToken)
+		}
+		if !candidateOwnsPath {
+			for _, conn := range connInfo.Conns {
+				if conn != nil {
+					_ = conn.Close()
+				}
+			}
+			if relayConn != nil {
+				_ = relayConn.Close()
+			}
+			return nil, errP2PCandidateSuperseded
 		}
 		if !connInfo.RelayUsed && relayConn != nil {
 			relayConn.Close()
 		}
+		statusMode = "P2P"
+		if connInfo.RelayMode {
+			statusMode = "Relay"
+		}
 	}
+
+	statusNetwork := strings.Join(connInfo.NetworksUsed, "+")
+	ReportP2PStatus(ncconfig, reportSessionID, "negotiating", statusNetwork, statusMode, connInfo.PeerAddress)
 
 	rawconn := connInfo.Conns[0]
 	nconn, err := p2pSecureNegotiation(ncconfig, connInfo, cipherSuite, ncconfig.useLAN)
 	if err != nil {
 		rawconn.Close()
-		ReportP2PStatus(ncconfig, topicSalt, fmt.Sprintf("error:%v", err), ncconfig.network, "", "")
+		return nil, reportP2PPathError(ncconfig, ncconfig.Ctx, reportSessionID, err)
+	}
+	if err := rejectSupersededP2PConnection(ncconfig.Ctx, nconn); err != nil {
 		return nil, err
 	}
 	if nconn.IsUDP {
@@ -2900,19 +3803,10 @@ func do_P2P(ncconfig *AppNetcatConfig) (*secure.NegotiatedConn, error) {
 	} else {
 		ncconfig.Logger.Printf("Connected to: %s\n", rawconn.RemoteAddr().String())
 	}
-	statusNetwork := strings.Join(connInfo.NetworksUsed, "+")
-	statusMode := "P2P"
-	if connInfo.RelayMode {
-		statusMode = "Relay"
-	}
-	ReportP2PStatus(ncconfig, topicSalt, "connected", statusNetwork, statusMode, connInfo.PeerAddress)
-	preOnClose := nconn.OnClose
-	nconn.OnClose = func() {
-		ReportP2PStatus(ncconfig, topicSalt, "disconnected", statusNetwork, statusMode, connInfo.PeerAddress)
-		if preOnClose != nil {
-			preOnClose()
-		}
-	}
+	ReportP2PStatus(ncconfig, reportSessionID, "connected", statusNetwork, statusMode, connInfo.PeerAddress)
+	nconn.AddOnClose(func() {
+		ReportP2PStatus(ncconfig, reportSessionID, "disconnected", statusNetwork, statusMode, connInfo.PeerAddress)
+	})
 	nconn.MQTTHelloCtrlPayload = helloPayload.CtrlString()
 	nconn.MQTTHelloAppPayload = helloPayload.AppString()
 	return nconn, nil
@@ -2970,7 +3864,7 @@ func p2pSecureNegotiation(ncconfig *AppNetcatConfig, connInfo *easyp2p.P2PConnIn
 		return nil, fmt.Errorf("unsupported cipher suite: %s", cipherSuite)
 	}
 
-	return secure.DoNegotiation(&config, conn, ncconfig.LogWriter)
+	return secure.DoNegotiationContext(ncconfig.Ctx, &config, conn, ncconfig.Logger)
 }
 
 func do_P2P_multipath(ncconfig *AppNetcatConfig, enableMP bool) (*secure.NegotiatedConn, error) {
@@ -3058,8 +3952,8 @@ func cleanupUnixSocket(path string) error {
 }
 
 type P2PStatusReport struct {
-	Topic     string `json:"topic"`     // random string
-	Status    string `json:"status"`    // wait / connecting / connected / disconnected / error
+	Topic     string `json:"topic"`     // report session id; legacy field name
+	Status    string `json:"status"`    // wait / connecting / negotiating / connected / disconnected / error
 	Network   string `json:"network"`   // tcp / udp
 	Mode      string `json:"mode"`      // p2p / relay
 	Peer      string `json:"peer"`      // IP:port
@@ -3067,13 +3961,21 @@ type P2PStatusReport struct {
 	PID       int    `json:"pid"`       // process ID
 }
 
-func ReportP2PStatus(ncconfig *AppNetcatConfig, mqttsess, status, network, mode, peer string) {
+func newP2PReportSessionID() string {
+	sessID, err := secure.GenerateSecureRandomString(10)
+	if err == nil {
+		return "p2p-" + sessID
+	}
+	return fmt.Sprintf("p2p-%d-%d", time.Now().UnixNano(), os.Getpid())
+}
+
+func ReportP2PStatus(ncconfig *AppNetcatConfig, sessionID, status, network, mode, peer string) {
 	if ncconfig.p2pReportURL == "" {
 		return
 	}
 
 	report := P2PStatusReport{
-		Topic:     mqttsess,
+		Topic:     sessionID,
 		Status:    status,
 		Network:   network,
 		Mode:      mode,

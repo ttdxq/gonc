@@ -18,6 +18,12 @@ README in [中文](./README_zh.md) 、 [English](./README.md)
 
 ---
 
+## Related Projects
+
+- [gonc-gui](https://github.com/threatexpert/gonc-gui) — a desktop (Windows) and Android app built on `gonc`: convenient cross-device, cross-network P2P direct connection and secure file transfer. Just share a passphrase (or scan a QR code); no command line required.
+
+---
+
 ## Usage Examples
 
 ### Basic Usage
@@ -241,7 +247,7 @@ For example, if both peers are behind symmetric NATs and P2P fails, having just 
     "tcp://turn.cloudflare.com:80",
     "udp://turn.cloudflare.com:53",
     "udp://stun.l.google.com:19302",
-    "udp://stun.miwifi.com:3478",
+    "stun.gonc.cc:3478",
     "global.turn.twilio.com:3478",
     "stun.nextcloud.com:443",
 

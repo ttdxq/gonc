@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,6 +36,11 @@ const (
 	LANMulticastPort = 19730
 	LANBeaconMagic   = "GONC-LAN-V1"
 	LANNonceSize     = 16
+
+	lanActiveBeaconInterval     = 1500 * time.Millisecond
+	lanActiveSlowBeaconInterval = 5 * time.Second
+	lanActiveFastBeaconWindow   = 30 * time.Second
+	lanPassiveBeaconInterval    = 15 * time.Second
 
 	lanMsgBeacon   = "B"
 	lanMsgResponse = "R"
@@ -192,6 +198,35 @@ func (f *lanSelfFilter) IsSelf(n string) bool {
 	return ok
 }
 
+type lanPunchPortSelector struct {
+	once     sync.Once
+	allocate func() (int, error)
+	logger   *log.Logger
+	port     int
+	err      error
+}
+
+func newLanPunchPortSelector(allocate func() (int, error), logger *log.Logger) *lanPunchPortSelector {
+	if allocate == nil {
+		allocate = GetFreePort
+	}
+	return &lanPunchPortSelector{allocate: allocate, logger: logger}
+}
+
+func (s *lanPunchPortSelector) Get() (int, error) {
+	s.once.Do(func() {
+		s.port, s.err = s.allocate()
+		if s.err != nil {
+			s.err = fmt.Errorf("allocate LAN punch port: %w", s.err)
+			return
+		}
+		if s.logger != nil {
+			s.logger.Printf("Selected punchPort=%d after authenticated peer discovery\n", s.port)
+		}
+	})
+	return s.port, s.err
+}
+
 // ============================================================================
 // 组播网络层
 // ============================================================================
@@ -200,12 +235,33 @@ type lanMcast struct {
 	rawConn net.PacketConn
 	conn    *ipv4.PacketConn
 	dst     *net.UDPAddr
-	ifaces  []net.Interface
+	ifaces  []lanMcastIface
+	logger  *log.Logger
+	warned  map[string]struct{}
+	warnMu  sync.Mutex
+	enumErr error
 }
 
-func newLanMcast() (*lanMcast, error) {
+type lanMcastIface struct {
+	iface net.Interface
+}
+
+type lanMessenger interface {
+	broadcast([]byte)
+	broadcastAndSendTo([]byte, net.Addr)
+}
+
+func newLanMcast(loggers ...*log.Logger) (*lanMcast, error) {
+	return newLanMcastWithInterfaces(net.Interfaces, loggers...)
+}
+
+func newLanMcastWithInterfaces(listInterfaces func() ([]net.Interface, error), loggers ...*log.Logger) (*lanMcast, error) {
 	gip := net.ParseIP(LANMulticastIP)
 	dst := &net.UDPAddr{IP: gip, Port: LANMulticastPort}
+	var logger *log.Logger
+	if len(loggers) > 0 {
+		logger = loggers[0]
+	}
 
 	c, err := net.ListenPacket("udp4", fmt.Sprintf("%s:%d", LANMulticastIP, LANMulticastPort))
 	if err != nil {
@@ -213,29 +269,103 @@ func newLanMcast() (*lanMcast, error) {
 	}
 	p := ipv4.NewPacketConn(c)
 
-	ifaces, _ := net.Interfaces()
-	var good []net.Interface
+	ifaces, enumErr := listInterfaces()
+	var good []lanMcastIface
 	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagMulticast == 0 {
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		if iface.Flags&net.FlagMulticast == 0 {
 			continue
 		}
 		if err := p.JoinGroup(&iface, &net.UDPAddr{IP: gip}); err == nil {
-			good = append(good, iface)
+			good = append(good, lanMcastIface{iface: iface})
+		} else if logger != nil {
+			logger.Printf("WARN: multicast join on %s failed: %v\n", iface.Name, err)
+		}
+	}
+	if len(good) == 0 {
+		if err := p.JoinGroup(nil, &net.UDPAddr{IP: gip}); err != nil {
+			_ = c.Close()
+			if enumErr != nil {
+				return nil, fmt.Errorf("join multicast group on system interface after interface enumeration failed (%v): %w", enumErr, err)
+			}
+			return nil, fmt.Errorf("join multicast group on system interface: %w", err)
 		}
 	}
 	p.SetMulticastLoopback(true)
 
-	return &lanMcast{rawConn: c, conn: p, dst: dst, ifaces: good}, nil
+	return &lanMcast{
+		rawConn: c, conn: p, dst: dst, ifaces: good,
+		logger: logger, warned: map[string]struct{}{},
+		enumErr: enumErr,
+	}, nil
 }
 
 func (mc *lanMcast) Close() { mc.rawConn.Close() }
 
 func (mc *lanMcast) broadcast(data []byte) {
-	for i := range mc.ifaces {
-		mc.conn.SetMulticastInterface(&mc.ifaces[i])
-		mc.conn.SetMulticastTTL(2)
-		mc.conn.WriteTo(data, nil, mc.dst)
+	if mc.enumErr != nil {
+		mc.warnOnce("ifaces-enum", "interface enumeration failed: %v", mc.enumErr)
 	}
+	for i := range mc.ifaces {
+		iface := &mc.ifaces[i]
+		if err := mc.conn.SetMulticastInterface(&iface.iface); err != nil {
+			mc.warnOnce("mcast-iface:"+iface.iface.Name, "multicast iface %s: %v", iface.iface.Name, err)
+			continue
+		}
+		mc.conn.SetMulticastTTL(2)
+		if _, err := mc.conn.WriteTo(data, nil, mc.dst); err != nil {
+			mc.warnOnce("mcast-write:"+iface.iface.Name, "multicast send on %s to %s: %v", iface.iface.Name, mc.dst, err)
+		}
+	}
+	if len(mc.ifaces) == 0 {
+		if _, err := mc.conn.WriteTo(data, nil, mc.dst); err != nil {
+			mc.warnOnce("fallback-write:"+mc.dst.String(), "fallback multicast send to %s: %v", mc.dst, err)
+		}
+	}
+}
+
+func (mc *lanMcast) sendTo(data []byte, dst net.Addr) {
+	if dst == nil {
+		return
+	}
+	if _, err := mc.conn.WriteTo(data, nil, dst); err != nil {
+		mc.warnOnce("unicast-write:"+dst.String(), "unicast send to %s: %v", dst, err)
+	}
+}
+
+func (mc *lanMcast) broadcastAndSendTo(data []byte, dst net.Addr) {
+	mc.broadcast(data)
+	mc.sendTo(data, dst)
+}
+
+func (mc *lanMcast) ifaceSummary() string {
+	if len(mc.ifaces) == 0 {
+		summary := "system-default"
+		if mc.enumErr != nil {
+			summary += fmt.Sprintf(" (enumErr=%v)", mc.enumErr)
+		}
+		return summary
+	}
+	parts := make([]string, 0, len(mc.ifaces))
+	for _, iface := range mc.ifaces {
+		parts = append(parts, iface.iface.Name)
+	}
+	return strings.Join(parts, "; ")
+}
+
+func (mc *lanMcast) warnOnce(key, format string, args ...interface{}) {
+	if mc.logger == nil {
+		return
+	}
+	mc.warnMu.Lock()
+	defer mc.warnMu.Unlock()
+	if _, ok := mc.warned[key]; ok {
+		return
+	}
+	mc.warned[key] = struct{}{}
+	mc.logger.Printf("WARN: "+format+"\n", args...)
 }
 
 // ============================================================================
@@ -311,69 +441,114 @@ func (d *lanDispatcher) run(ctx context.Context, mc *lanMcast, key []byte) {
 // ============================================================================
 
 func LANDiscover(ctx context.Context, sessionKey, transportPref string, timeout time.Duration, logWriter io.Writer) (*LANDiscoverResult, error) {
+	return lanDiscover(ctx, sessionKey, transportPref, timeout, false, logWriter)
+}
+
+func LANDiscoverPassive(ctx context.Context, sessionKey, transportPref string, timeout time.Duration, logWriter io.Writer) (*LANDiscoverResult, error) {
+	return lanDiscover(ctx, sessionKey, transportPref, timeout, true, logWriter)
+}
+
+type lanDiscoverWorker func() (*LANDiscoverResult, error)
+
+type lanDiscoverWorkerResult struct {
+	result *LANDiscoverResult
+	err    error
+}
+
+func runLANDiscoverWorkers(ctx context.Context, cancel context.CancelFunc, workers ...lanDiscoverWorker) (*LANDiscoverResult, error) {
+	results := make(chan lanDiscoverWorkerResult, len(workers))
+	for _, worker := range workers {
+		worker := worker
+		go func() {
+			result, err := worker()
+			results <- lanDiscoverWorkerResult{result: result, err: err}
+		}()
+	}
+	return collectLANDiscoverWorkerResults(ctx, cancel, results, len(workers))
+}
+
+func collectLANDiscoverWorkerResults(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	results <-chan lanDiscoverWorkerResult,
+	workerCount int,
+) (*LANDiscoverResult, error) {
+	defer cancel()
+	for i := 0; i < workerCount; i++ {
+		var outcome lanDiscoverWorkerResult
+		select {
+		case outcome = <-results:
+		default:
+			select {
+			case outcome = <-results:
+			case <-ctx.Done():
+				select {
+				case outcome = <-results:
+				default:
+					return nil, fmt.Errorf("LAN discovery timeout")
+				}
+			}
+		}
+		if outcome.err != nil {
+			return nil, outcome.err
+		}
+		if outcome.result != nil {
+			return outcome.result, nil
+		}
+	}
+	return nil, fmt.Errorf("LAN discovery failed")
+}
+
+func lanDiscover(ctx context.Context, sessionKey, transportPref string, timeout time.Duration, passive bool, logWriter io.Writer) (*LANDiscoverResult, error) {
+	return lanDiscoverWithPortAllocator(ctx, sessionKey, transportPref, timeout, passive, logWriter, GetFreePort)
+}
+
+func lanDiscoverWithPortAllocator(
+	ctx context.Context,
+	sessionKey, transportPref string,
+	timeout time.Duration,
+	passive bool,
+	logWriter io.Writer,
+	allocate func() (int, error),
+) (*LANDiscoverResult, error) {
 	logger := misc.NewLog(logWriter, "[LAN] ", log.LstdFlags|log.Lmsgprefix)
 	key := lanDeriveKey(sessionKey)
 	sid := lanDeriveSessionID(sessionKey)
 	sf := newSelfFilter()
+	punchPorts := newLanPunchPortSelector(allocate, logger)
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	punchPort, err := GetFreePort()
-	if err != nil {
-		return nil, fmt.Errorf("alloc port: %v", err)
-	}
-
-	mc, err := newLanMcast()
+	mc, err := newLanMcast(logger)
 	if err != nil {
 		return nil, err
 	}
 	defer mc.Close()
 
-	logger.Printf("Multicast %s:%d, %d ifaces, punchPort=%d\n",
-		LANMulticastIP, LANMulticastPort, len(mc.ifaces), punchPort)
+	logger.Printf("Multicast %s:%d, %d ifaces\n", LANMulticastIP, LANMulticastPort, len(mc.ifaces))
+	logger.Printf("Interfaces: %s\n", mc.ifaceSummary())
 
 	// 启动分发器
 	disp := newLanDispatcher()
 	go disp.run(ctx, mc, key)
 
-	type dr struct {
-		r   *LANDiscoverResult
-		err error
+	initiatorRole := "Initiator"
+	if passive {
+		initiatorRole = "Passive"
+		logger.Printf("Mode: passive startup burst, then beacon every %s\n", lanPassiveBeaconInterval)
+	} else {
+		logger.Printf("Mode: active beacon every %s for %s, then every %s\n",
+			lanActiveBeaconInterval, lanActiveFastBeaconWindow, lanActiveSlowBeaconInterval)
 	}
-	ch := make(chan dr, 2)
-
-	go func() {
-		r, e := lanInitiator(ctx, mc, disp, key, sid, transportPref, punchPort, sf, logger)
-		ch <- dr{r, e}
-	}()
-	go func() {
-		r, e := lanResponder(ctx, mc, disp, key, sid, transportPref, punchPort, sf, logger)
-		ch <- dr{r, e}
-	}()
-
-	var lastErr error
-	for i := 0; i < 2; i++ {
-		select {
-		case d := <-ch:
-			if d.err == nil && d.r != nil {
-				cancel()
-				return d.r, nil
-			}
-			if d.err != nil {
-				lastErr = d.err
-			}
-		case <-ctx.Done():
-			if lastErr != nil {
-				return nil, lastErr
-			}
-			return nil, fmt.Errorf("LAN discovery timeout")
-		}
-	}
-	if lastErr != nil {
-		return nil, lastErr
-	}
-	return nil, fmt.Errorf("LAN discovery failed")
+	return runLANDiscoverWorkers(ctx, cancel,
+		func() (*LANDiscoverResult, error) {
+			return lanInitiator(ctx, mc, disp, key, sid, transportPref, bestLocalIPForRemote, punchPorts, sf, logger, passive, initiatorRole)
+		},
+		func() (*LANDiscoverResult, error) {
+			return lanResponder(ctx, mc, disp, key, sid, transportPref, bestLocalIPForRemote, punchPorts, sf, logger)
+		},
+	)
 }
 
 // ============================================================================
@@ -385,9 +560,10 @@ func LANDiscover(ctx context.Context, sessionKey, transportPref string, timeout 
 // ============================================================================
 
 func lanInitiator(
-	ctx context.Context, mc *lanMcast, disp *lanDispatcher,
-	key []byte, sid, tp string, punchPort int,
+	ctx context.Context, mc lanMessenger, disp *lanDispatcher,
+	key []byte, sid, tp string, selectLocalIP func(string) (string, error), punchPorts *lanPunchPortSelector,
 	sf *lanSelfFilter, logger *log.Logger,
+	passive bool, roleName string,
 ) (*LANDiscoverResult, error) {
 
 	nonceA := lanNonce()
@@ -397,33 +573,24 @@ func lanInitiator(
 		SessionID: sid, NonceA: nonceA, Transport: tp,
 	})
 
-	logger.Printf("Initiator: broadcasting beacon\n")
+	logger.Printf("%s: broadcasting beacon\n", roleName)
 	mc.broadcast(beaconData)
 
-	// 持续广播 beacon
-	beaconStop := make(chan struct{})
-	go func() {
-		tk := time.NewTicker(1500 * time.Millisecond)
-		defer tk.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-beaconStop:
-				return
-			case <-tk.C:
-				mc.broadcast(beaconData)
-			}
-		}
-	}()
+	beaconsSent := 1
+	beaconTimer := time.NewTimer(lanNextBeaconDelay(passive, beaconsSent))
+	defer beaconTimer.Stop()
 
 	// ── Phase 1: 从 responseCh 等 Response ──
 	var resp lanResponse
+	var respSrc net.Addr
 	for {
 		select {
 		case <-ctx.Done():
-			close(beaconStop)
 			return nil, ctx.Err()
+		case <-beaconTimer.C:
+			mc.broadcast(beaconData)
+			beaconsSent++
+			beaconTimer.Reset(lanNextBeaconDelay(passive, beaconsSent))
 		case pkt := <-disp.responseCh:
 			if err := lanUnmarshal(pkt.msg, &resp); err != nil {
 				continue
@@ -431,16 +598,19 @@ func lanInitiator(
 			if resp.NonceA != nonceA {
 				continue
 			}
-			// 收到有效 response, 停止发 beacon
-			close(beaconStop)
+			respSrc = pkt.src
 			goto GotResponse
 		}
 	}
 GotResponse:
 
-	localIP, _ := bestLocalIPForRemote(resp.IP)
+	localIP, _ := selectLocalIP(resp.IP)
 	finalTP := negotiateTransport(tp, resp.Transport)
-	logger.Printf("Initiator: got response from %s:%d, localIP=%s\n", resp.IP, resp.Port, localIP)
+	punchPort, err := punchPorts.Get()
+	if err != nil {
+		return nil, err
+	}
+	logger.Printf("%s: got response from %s:%d, localIP=%s\n", roleName, resp.IP, resp.Port, localIP)
 
 	// ── Phase 2: 发 Confirm + 等 Ack ──
 	{
@@ -451,7 +621,7 @@ GotResponse:
 
 		// 立即发几轮
 		for i := 0; i < 3; i++ {
-			mc.broadcast(confirmData)
+			mc.broadcastAndSendTo(confirmData, respSrc)
 			time.Sleep(50 * time.Millisecond)
 		}
 
@@ -464,7 +634,7 @@ GotResponse:
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			case <-confirmTk.C:
-				mc.broadcast(confirmData)
+				mc.broadcastAndSendTo(confirmData, respSrc)
 			case pkt := <-disp.ackCh:
 				var ack lanAck
 				if err := lanUnmarshal(pkt.msg, &ack); err != nil {
@@ -474,7 +644,7 @@ GotResponse:
 					continue
 				}
 
-				logger.Printf("Initiator: got ACK → discovery complete\n")
+				logger.Printf("%s: got ACK → discovery complete\n", roleName)
 				logger.Printf("  local=%s:%d remote=%s:%d tp=%s\n",
 					localIP, punchPort, resp.IP, resp.Port, finalTP)
 
@@ -488,6 +658,28 @@ GotResponse:
 	}
 }
 
+func lanNextBeaconDelay(passive bool, beaconsSent int) time.Duration {
+	if !passive {
+		fastBeaconCount := int(lanActiveFastBeaconWindow / lanActiveBeaconInterval)
+		if beaconsSent > fastBeaconCount {
+			return lanActiveSlowBeaconInterval
+		}
+		return lanActiveBeaconInterval
+	}
+
+	startupDelays := [...]time.Duration{
+		250 * time.Millisecond,
+		750 * time.Millisecond,
+		4 * time.Second,
+		10 * time.Second,
+	}
+	if index := beaconsSent - 1; index >= 0 && index < len(startupDelays) {
+		return startupDelays[index]
+	}
+
+	return lanPassiveBeaconInterval
+}
+
 // ============================================================================
 // Responder
 //   1. 从 disp.beaconCh 等 Beacon
@@ -497,8 +689,8 @@ GotResponse:
 // ============================================================================
 
 func lanResponder(
-	ctx context.Context, mc *lanMcast, disp *lanDispatcher,
-	key []byte, sid, tp string, punchPort int,
+	ctx context.Context, mc lanMessenger, disp *lanDispatcher,
+	key []byte, sid, tp string, selectLocalIP func(string) (string, error), punchPorts *lanPunchPortSelector,
 	sf *lanSelfFilter, logger *log.Logger,
 ) (*LANDiscoverResult, error) {
 
@@ -508,7 +700,7 @@ func lanResponder(
 		// ── Phase 1: 从 beaconCh 等 Beacon ──
 		var b lanBeacon
 		var remoteIP, localIP string
-
+		var beaconSrc net.Addr
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -525,10 +717,15 @@ func lanResponder(
 				continue
 			}
 			var err error
-			localIP, err = bestLocalIPForRemote(remoteIP)
+			localIP, err = selectLocalIP(remoteIP)
 			if err != nil || localIP == remoteIP {
 				continue
 			}
+			beaconSrc = pkt.src
+		}
+		punchPort, err := punchPorts.Get()
+		if err != nil {
+			return nil, err
 		}
 
 		logger.Printf("Responder: beacon from %s, bestLocal=%s\n", remoteIP, localIP)
@@ -542,7 +739,7 @@ func lanResponder(
 
 		// 立即发几轮
 		for i := 0; i < 3; i++ {
-			mc.broadcast(respData)
+			mc.broadcastAndSendTo(respData, beaconSrc)
 			time.Sleep(50 * time.Millisecond)
 		}
 
@@ -550,6 +747,7 @@ func lanResponder(
 		respTk := time.NewTicker(300 * time.Millisecond)
 		confirmDeadline := time.After(10 * time.Second)
 		var confirm lanConfirm
+		var confirmSrc net.Addr
 		gotConfirm := false
 
 		for !gotConfirm {
@@ -562,7 +760,7 @@ func lanResponder(
 				logger.Printf("Responder: confirm timeout, resume beacon listen\n")
 				goto NextBeacon
 			case <-respTk.C:
-				mc.broadcast(respData)
+				mc.broadcastAndSendTo(respData, beaconSrc)
 			case pkt := <-disp.confirmCh:
 				if err := lanUnmarshal(pkt.msg, &confirm); err != nil {
 					continue
@@ -570,6 +768,7 @@ func lanResponder(
 				if confirm.NonceB != nonceB {
 					continue
 				}
+				confirmSrc = pkt.src
 				gotConfirm = true
 			}
 		}
@@ -581,7 +780,7 @@ func lanResponder(
 
 			// 多发几轮, 确保 initiator 收到
 			for i := 0; i < 8; i++ {
-				mc.broadcast(ackData)
+				mc.broadcastAndSendTo(ackData, confirmSrc)
 				time.Sleep(100 * time.Millisecond)
 			}
 
@@ -606,19 +805,31 @@ func lanResponder(
 //
 // 流程: 组播发现(四步握手) → 构造 P2PAddressInfo → Auto_P2P_*(round=0)
 //
-// round=0 使打洞函数跳过 Mqtt_P2P_Round_Sync:
-//   if round > 0 {
-//       err = Mqtt_P2P_Round_Sync(...)  // round=0 不进这里
-//   }
-//
-// 时机同步由四步握手保证: 双方都收到并确认了对方地址后才返回,
-// 之后几乎同时进入打洞阶段。
+// round=0 makes traversal skip Mqtt_P2P_Round_Sync because explicit LAN mode
+// has no MQTT signal session. The multicast handshake authenticates and
+// exchanges addresses, but it finishes before traversal binds TCP listeners.
+// TCP traversal therefore retries round-0 same-LAN direct dials while keeping
+// its accept path active.
 // ============================================================================
 
 func Easy_P2P_LAN(ctx context.Context, sessionKey, transportPref string, timeout time.Duration, logWriter io.Writer) (*P2PConnInfo, error) {
+	return easyP2PLAN(ctx, sessionKey, transportPref, timeout, false, logWriter)
+}
+
+func Easy_P2P_LAN_Passive(ctx context.Context, sessionKey, transportPref string, timeout time.Duration, logWriter io.Writer) (*P2PConnInfo, error) {
+	return easyP2PLAN(ctx, sessionKey, transportPref, timeout, true, logWriter)
+}
+
+func easyP2PLAN(ctx context.Context, sessionKey, transportPref string, timeout time.Duration, passive bool, logWriter io.Writer) (*P2PConnInfo, error) {
 	fmt.Fprintf(logWriter, "=== LAN Discovery Mode ===\n")
 
-	result, err := LANDiscover(ctx, sessionKey, transportPref, timeout, logWriter)
+	var result *LANDiscoverResult
+	var err error
+	if passive {
+		result, err = LANDiscoverPassive(ctx, sessionKey, transportPref, timeout, logWriter)
+	} else {
+		result, err = LANDiscover(ctx, sessionKey, transportPref, timeout, logWriter)
+	}
 	if err != nil {
 		return nil, err
 	}
