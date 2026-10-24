@@ -57,3 +57,23 @@ func TestLANProbeSelectionMirrorsLegacyPeerTraversal(t *testing.T) {
 		t.Fatalf("selected candidate does not mirror legacy peer traversal: %+v", selectedA)
 	}
 }
+
+
+func TestIsSameHostOrSubnetIP(t *testing.T) {
+	peerIP := "2001:da8:2019:b282:26cf:24ff:fe17:6648"
+	stunTempIP := "2001:da8:2019:b282:9876:5432:10fe:dcba"
+	otherIP := "2001:da8:2019:b283:26cf:24ff:fe17:6648"
+
+	if !isSameHostOrSubnetIP(peerIP, stunTempIP) {
+		t.Fatalf("expected same IPv6 /64 subnet to match")
+	}
+	if isSameHostOrSubnetIP(peerIP, otherIP) {
+		t.Fatalf("expected different IPv6 /64 subnet not to match")
+	}
+	if !isSameHostOrSubnetIP("1.2.3.4", "1.2.3.4") {
+		t.Fatalf("expected identical IPv4 to match")
+	}
+	if isSameHostOrSubnetIP("1.2.3.4", "1.2.3.5") {
+		t.Fatalf("expected different IPv4 not to match")
+	}
+}

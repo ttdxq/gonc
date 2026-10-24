@@ -787,15 +787,51 @@ func IsSameLAN(ip1, ip2 string) bool {
 		return false
 	}
 
-	// IPv6 私有地址判断 (ULA, fc00::/7)
-	if parsed1.IsPrivate() && parsed2.IsPrivate() {
-		// 简单判断前 64 位是否相同（通常 IPv6 LAN 使用相同前缀）
-		for i := 0; i < 8; i++ {
-			if parsed1[i] != parsed2[i] {
-				return false
+	// IPv6 地址判断：同属一个 /64 前缀（前 8 字节）视作同一个 LAN/子网
+	if parsed1.To4() == nil && parsed2.To4() == nil {
+		p1 := parsed1.To16()
+		p2 := parsed2.To16()
+		if p1 != nil && p2 != nil {
+			for i := 0; i < 8; i++ {
+				if p1[i] != p2[i] {
+					return false
+				}
 			}
+			return true
 		}
+	}
+	return false
+}
+
+// isSameHostOrSubnetIP 检查两 IP 是否相同或同属于一个 IPv6 /64 子网（以兼容 IPv6 隐私扩展临时地址）
+func isSameHostOrSubnetIP(ip1Str, ip2Str string) bool {
+	if ip1Str == "" || ip2Str == "" {
+		return false
+	}
+	if ip1Str == ip2Str {
 		return true
+	}
+	p1 := net.ParseIP(ip1Str)
+	p2 := net.ParseIP(ip2Str)
+	if p1 == nil || p2 == nil {
+		return false
+	}
+	if p1.Equal(p2) {
+		return true
+	}
+	// 对 IPv6 地址，支持 IPv6 隐私扩展（RFC 4941/RFC 8981）：
+	// 同一网卡/主机的临时地址与固定地址共享相同的 /64 网络前缀
+	if p1.To4() == nil && p2.To4() == nil {
+		b1 := p1.To16()
+		b2 := p2.To16()
+		if b1 != nil && b2 != nil {
+			for i := 0; i < 8; i++ {
+				if b1[i] != b2[i] {
+					return false
+				}
+			}
+			return true
+		}
 	}
 	return false
 }
@@ -2162,14 +2198,14 @@ func Auto_P2P_TCP_NAT_Traversal(ctx context.Context, network, sessionUid string,
 						return splitErr
 					}
 					remoteLANIP := extractIP(p2pInfo.RemoteLAN)
-					if peerIP == remoteIP ||
+					if isSameHostOrSubnetIP(peerIP, remoteIP) ||
 						(sameNAT && similarLAN && IsSameLAN(peerIP, remoteIP)) ||
-						(sameNAT && remoteLANIP != "" && peerIP == remoteLANIP) ||
-						(lanProbeEnabled && (peerIP == remoteLANIP || IsSameLAN(peerIP, localAddr.IP.String()))) {
+						(sameNAT && remoteLANIP != "" && isSameHostOrSubnetIP(peerIP, remoteLANIP)) ||
+						(lanProbeEnabled && (isSameHostOrSubnetIP(peerIP, remoteLANIP) || IsSameLAN(peerIP, localAddr.IP.String()))) {
 						return nil
 					}
 					for _, validIP := range p2pInfo.AllRemoteIPs {
-						if peerIP == validIP {
+						if isSameHostOrSubnetIP(peerIP, validIP) {
 							return nil
 						}
 					}
